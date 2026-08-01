@@ -37,43 +37,55 @@ Drive a mi disco". Solo ve las carpetas que le hayas autorizado (por seguridad).
 
 ## 3. Cómo se conecta el Agente Drive a Claude
 
-Importante: el Agente Drive **no se da de alta por URL** (eso pide HTTPS y es para
-servidores remotos). Los programas locales se conectan por **stdio**, es decir, como una
-entrada en el fichero de configuración de Claude, igual que el resto de tus MCP locales
-(Jurisprudenciador, Outlook, etc.). Claude arranca el agente solo cuando lo necesita.
+El Agente Drive **no se da de alta por URL** (eso pide HTTPS y es para servidores remotos).
+Los programas locales se conectan por **stdio**: una entrada en el fichero de configuración
+de Claude, igual que el resto de tus MCP locales (Jurisprudenciador, Outlook, etc.). Claude
+arranca el agente solo cuando lo necesita.
 
-Ya está hecho en este ordenador. Solo queda un paso para activarlo: **cerrar Claude del
-todo y volver a abrirlo**. Al reabrir aparece el conector "agente-drive" en la lista.
+### REGLA CRÍTICA: Claude tiene que estar CERRADO al dar de alta el conector
+
+Claude mantiene su configuración en memoria y **la reescribe en disco al guardar**. Si
+añades el conector con la app abierta, al cerrar Claude machaca el cambio y el conector
+desaparece. Por eso el alta se hace **siempre con Claude completamente cerrado** (Cmd+Q,
+que no quede ningún proceso). El script `conectar_claude.sh` lo detecta y se niega a actuar
+si la app está abierta, para que no te pase.
+
+### Pasos (en este ordenador y en cualquiera)
+
+1. Cierra Claude por completo (Cmd+Q).
+2. Abre Terminal y ejecuta:
+   `cd ~/mcp-drive-local && ./conectar_claude.sh`
+3. Vuelve a abrir Claude. El conector "agente-drive" ya estará y **persistirá** en los
+   siguientes reinicios (porque estaba presente al arrancar).
+4. En un chat nuevo, pídele: "lista mis carpetas permitidas del Agente Drive" para
+   confirmar que responde.
 
 ## 4. Instalar el Agente Drive en un ordenador nuevo (p. ej. la oficina)
 
 1. **Traer el programa.** Clona el repositorio privado o copia la carpeta:
    `git clone https://github.com/josemagarciaruiz-cmd/mcp-drive-local`
 2. **Crear el archivo `.env`.** Copia `.env.example` a `.env` y rellena:
-   - Las credenciales de Google (las mismas de siempre: CLIENT_ID, CLIENT_SECRET,
-     REFRESH_TOKEN).
-   - `ALLOWED_DIRS` con las carpetas **reales de esa máquina** que quieras conectar
-     (las de la oficina, no las de casa).
-3. **Instalar.** Ejecuta `./install.sh` (si diera "permission denied", antes:
-   `chmod +x install.sh`). Esto prepara el entorno y las dependencias.
-4. **Dar de alta el conector en Claude.** Se añade una entrada `agente-drive` en el fichero
-   de configuración de Claude de ese equipo (modo stdio), apuntando al Python del entorno y
-   al `agent.py`, con las credenciales y `ALLOWED_DIRS`. (Se puede automatizar con un
-   pequeño script para que sea copiar-pegar.)
-5. **Reiniciar Claude** en ese ordenador.
+   - Las credenciales de Google (CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN).
+   - `ALLOWED_DIRS` con las carpetas **reales de esa máquina** (las de la oficina).
+3. **Instalar.** `./install.sh` (si diera "permission denied": `chmod +x install.sh`).
+4. **Conectar a Claude CON CLAUDE CERRADO.** Cierra Claude (Cmd+Q) y ejecuta
+   `./conectar_claude.sh`. Da de alta el conector `agente-drive` automáticamente.
+5. **Abrir Claude.** Listo.
 
 La URL de **MCP Drive** no cambia y ya la tienes en la oficina; solo el Agente Drive se
 instala máquina por máquina.
 
 ## 5. Detalles técnicos (por si hacen falta)
 
-- El Agente Drive puede arrancar de dos formas, según la variable `MCP_TRANSPORT`:
+- El Agente Drive arranca según la variable `MCP_TRANSPORT`:
   - `stdio` (por defecto) → conector local en Claude Desktop. Es lo que usamos.
-  - `streamable-http` → servicio HTTP en `127.0.0.1:8765` (por si algún día se quiere
-    montar como servicio con URL local).
+  - `streamable-http` → servicio HTTP en `127.0.0.1:8765` (por si se quisiera montar como
+    servicio con URL local).
 - Las credenciales y las carpetas autorizadas viven en el `.env` del ordenador (y, para el
   conector, en el config de Claude). Nunca se suben a GitHub.
 - Herramientas del Agente Drive: `local_allowed_dirs`, `local_list`,
   `local_upload_to_drive`, `local_upload_folder`, `local_download_from_drive`,
   `local_download_folder`.
+- `conectar_claude.sh` se niega a actuar si Claude está abierto (evita que el cambio se
+  pierda). Con la app cerrada, da de alta el conector y hace copia de seguridad del config.
 - Repositorio: https://github.com/josemagarciaruiz-cmd/mcp-drive-local (privado).

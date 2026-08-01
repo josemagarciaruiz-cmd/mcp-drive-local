@@ -32,7 +32,26 @@ def load_env(p):
         ev[k.strip()] = v.strip().strip('"').strip("'")
     return ev
 
+def claude_running():
+    import subprocess
+    try:
+        if platform.system() == "Darwin":
+            r = subprocess.run(["pgrep","-f","/Applications/Claude.app"], capture_output=True, text=True)
+            return r.returncode == 0 and r.stdout.strip() != ""
+        if platform.system() == "Windows":
+            r = subprocess.run(["tasklist"], capture_output=True, text=True)
+            return "Claude.exe" in r.stdout
+        r = subprocess.run(["pgrep","-x","claude"], capture_output=True, text=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
 def main():
+    if claude_running() and "--force" not in sys.argv:
+        sys.exit("ATENCION: Claude esta ABIERTO. Cierralo POR COMPLETO (Cmd+Q) y vuelve a\n"
+                 "ejecutar este script. Si editas el conector con la app abierta, Claude\n"
+                 "sobrescribe el cambio al guardar y el conector NO aparece.\n"
+                 "(Si sabes lo que haces: repite con  --force )")
     ev = load_env(ENVP)
     faltan = [k for k in ("GOOGLE_CLIENT_ID","GOOGLE_CLIENT_SECRET","GOOGLE_REFRESH_TOKEN") if not ev.get(k)]
     if faltan:
