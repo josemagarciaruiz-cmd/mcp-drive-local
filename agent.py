@@ -32,8 +32,10 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 AGENT_HOST = os.environ.get("AGENT_HOST", "127.0.0.1")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "8765"))
-ALLOWED = [os.path.realpath(os.path.expanduser(p.strip()))
-           for p in os.environ.get("ALLOWED_DIRS", "~").split(":") if p.strip()]
+# En Windows el separador es ';' (las rutas llevan 'C:'); en Mac/Linux es ':'.
+_ALLOWED_SEP = ";" if os.name == "nt" else ":"
+ALLOWED = [os.path.realpath(os.path.expanduser(os.path.expandvars(p.strip())))
+           for p in os.environ.get("ALLOWED_DIRS", "~").split(_ALLOWED_SEP) if p.strip()]
 
 mcp = FastMCP("MCP Drive Local", host=AGENT_HOST, port=AGENT_PORT)
 
