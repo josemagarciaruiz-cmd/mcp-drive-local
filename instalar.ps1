@@ -29,7 +29,9 @@ if (-not (Test-Path ".env")) {
 }
 
 Write-Host ""
-Write-Host "==> 3/3  Dando de alta el conector en Claude..."
+Write-Host "==> 3/3  Cerrando Claude (necesario para registrar el conector) y dando de alta..."
+taskkill /IM Claude.exe /F /T 2>$null | Out-Null
+Start-Sleep -Seconds 3
 & .\.venv\Scripts\python.exe conectar_claude.py
 
 Write-Host ""
