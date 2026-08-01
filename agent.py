@@ -225,4 +225,11 @@ def local_download_folder(folder_id: str, local_dir: str) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    # Transporte seleccionable por entorno:
+    #   MCP_TRANSPORT=stdio            -> conector local en Claude Desktop (por defecto)
+    #   MCP_TRANSPORT=streamable-http  -> servicio HTTP (escenario oficina por URL)
+    _t = os.environ.get("MCP_TRANSPORT", "stdio")
+    if _t == "streamable-http":
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
