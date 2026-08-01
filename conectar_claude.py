@@ -32,21 +32,46 @@ def load_env(p):
         ev[k.strip()] = v.strip().strip('"').strip("'")
     return ev
 
-def claude_running():
+def claude_procs():
+    """Devuelve la lista de procesos de la APP de escritorio Claude que estan vivos.
+    Excluye 'chrome-native-host' (lo lanza Chrome, sobrevive al Cmd+Q) y el
+    'crashpad' handler, que no indican que la app este abierta."""
     import subprocess
+    procs=[]
     try:
-        if platform.system() == "Darwin":
-            r = subprocess.run(["pgrep","-f","/Applications/Claude.app"], capture_output=True, text=True)
-            return r.returncode == 0 and r.stdout.strip() != ""
-        if platform.system() == "Windows":
-            r = subprocess.run(["tasklist"], capture_output=True, text=True)
-            return "Claude.exe" in r.stdout
-        r = subprocess.run(["pgrep","-x","claude"], capture_output=True, text=True)
-        return r.returncode == 0
+        sysname=platform.system()
+        if sysname=="Windows":
+            out=subprocess.run(["tasklist"],capture_output=True,text=True).stdout
+            return ["Claude.exe"] if "Claude.exe" in out else []
+        out=subprocess.run(["ps","-Ao","command="],capture_output=True,text=True).stdout
+        for line in out.splitlines():
+            l=line.strip()
+            if sysname=="Darwin":
+                if "/Applications/Claude.app" not in l:
+                    continue
+            else:
+                if "claude" not in l.lower() or ".app" not in l.lower():
+                    continue
+            if "chrome-native-host" in l or "crashpad" in l:
+                continue
+            if "conectar_claude" in l:
+                continue
+            procs.append(l[:70])
     except Exception:
-        return False
+        pass
+    return procs
+
 
 def main():
+    procs=claude_procs()
+    if procs and "--force" not in sys.argv:
+        muestra="\n".join("   - "+x for x in procs[:6])
+        sys.exit("ATENCION: Claude (app de escritorio) sigue ABIERTO. Cierralo del todo\n"
+                 "con Cmd+Q, espera 3 segundos y repite. Procesos detectados:\n"
+                 + muestra +
+                 "\n(Nota: chrome-native-host y crashpad ya se ignoran; si aqui ves solo\n"
+                 " esos, avisame. Con --force forzarias, pero perderias el cambio.)")
+
     if claude_running() and "--force" not in sys.argv:
         sys.exit("ATENCION: Claude esta ABIERTO. Cierralo POR COMPLETO (Cmd+Q) y vuelve a\n"
                  "ejecutar este script. Si editas el conector con la app abierta, Claude\n"
