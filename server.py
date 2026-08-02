@@ -1078,27 +1078,44 @@ def drive_remediar_externos(page_size: int = 100, dry_run: bool = True) -> dict:
         res = svc.files().list(q=q, pageSize=max(1, min(page_size, 1000)),
                                fields=f"files({FILE_FIELDS})", supportsAllDrives=True,
                                includeItemsFromAllDrives=True).execute()
+        # Recoger TODOS los ficheros publicos (paginando)
+        files=[]; token=None
+        while True:
+            r = svc.files().list(q=q, pageSize=1000, pageToken=token,
+                fields=f"nextPageToken, files({FILE_FIELDS})",
+                supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+            files.extend(r.get("files", []))
+            token = r.get("nextPageToken")
+            if not token:
+                break
         acciones = []
-        for f in res.get("files", []):
-            perms = svc.permissions().list(
-                fileId=f["id"], fields="permissions(id, type, role)",
-                supportsAllDrives=True).execute().get("permissions", [])
-            for pm in perms:
-                if pm.get("type") == "anyone":
-                    if dry_run:
-                        acciones.append({"file_id": f["id"], "name": f.get("name"),
-                                         "quitaria_permiso": pm.get("id"),
-                                         "role": pm.get("role")})
-                    else:
-                        svc.permissions().delete(fileId=f["id"], permissionId=pm["id"],
-                                                 supportsAllDrives=True).execute()
-                        _audit("drive_remediar_externos",
-                               {"file_id": f["id"], "name": f.get("name"),
-                                "permiso_eliminado": pm.get("id")})
-                        acciones.append({"file_id": f["id"], "name": f.get("name"),
-                                         "permiso_eliminado": pm.get("id"),
-                                         "role": pm.get("role")})
-        return {"ok": True, "dry_run": dry_run, "num": len(acciones), "acciones": acciones}
+        omitidos = 0
+        for f in files:
+            try:
+                perms = svc.permissions().list(
+                    fileId=f["id"], fields="permissions(id, type, role)",
+                    supportsAllDrives=True).execute().get("permissions", [])
+                for pm in perms:
+                    if pm.get("type") == "anyone":
+                        if dry_run:
+                            acciones.append({"file_id": f["id"], "name": f.get("name"),
+                                             "mimeType": f.get("mimeType"),
+                                             "quitaria_permiso": pm.get("id"),
+                                             "role": pm.get("role")})
+                        else:
+                            svc.permissions().delete(fileId=f["id"], permissionId=pm["id"],
+                                                     supportsAllDrives=True).execute()
+                            _audit("drive_remediar_externos",
+                                   {"file_id": f["id"], "name": f.get("name"),
+                                    "permiso_eliminado": pm.get("id")})
+                            acciones.append({"file_id": f["id"], "name": f.get("name"),
+                                             "permiso_eliminado": pm.get("id"),
+                                             "role": pm.get("role")})
+            except Exception:
+                omitidos += 1
+                continue
+        return {"ok": True, "dry_run": dry_run, "num": len(acciones),
+                "omitidos_sin_permiso": omitidos, "acciones": acciones}
     except Exception as e:
         return _err("drive_remediar_externos", e)
 
