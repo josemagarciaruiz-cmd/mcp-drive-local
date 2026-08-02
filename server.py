@@ -37,9 +37,10 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 SCOPES = ["https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/gmail.modify",
           "https://www.googleapis.com/auth/gmail.send",
+          "https://www.googleapis.com/auth/gmail.settings.basic",
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/tasks",
-          "https://www.googleapis.com/auth/contacts.readonly"]
+          "https://www.googleapis.com/auth/contacts"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 # Campos estándar que devolvemos de cada archivo/carpeta
@@ -2662,6 +2663,1214 @@ def gmail_archivar_en(message_id: str, carpeta: str, crear_si_no_existe: bool = 
         return {"ok": True, "message_id": message_id, "carpeta": carpeta, "label_id": lid}
     except Exception as e:
         return _err("gmail_archivar_en", e)
+
+
+# =====================================================================
+# BLOQUE: Gmail acciones basicas (Gmail v1)
+# Se APPENDEA a server.py. No anade imports de nivel modulo ni redefine nada.
+# Usa helpers ya existentes: _get_gmail(), _err(), _audit().
+# =====================================================================
+
+
+@mcp.tool()
+def gmail_responder_a_todos(message_id: str, texto: str):
+    """Responde a TODOS los participantes de un correo dentro de su MISMO hilo.
+
+    Obtiene el mensaje original (From, To, Cc, Subject, Message-Id, References,
+    threadId), compone la respuesta con destinatarios el remitente original mas
+    todos los To y Cc originales EXCLUYENDO la propia direccion del usuario,
+    asunto con prefijo 'Re:' y cabeceras In-Reply-To y References, y la envia en
+    el mismo threadId. Devuelve el id del mensaje enviado.
+    """
+    try:
+        from email.mime.text import MIMEText
+        from email.utils import getaddresses, formataddr
+        svc = _get_gmail()
+        yo = svc.users().getProfile(userId='me').execute().get('emailAddress', '') or ''
+        original = svc.users().messages().get(
+            userId='me', id=message_id, format='metadata',
+            metadataHeaders=['From', 'To', 'Cc', 'Subject', 'Message-Id', 'References']).execute()
+        thread_id = original.get('threadId')
+        headers = original.get('payload', {}).get('headers', [])
+
+        def _h(name):
+            for h in headers:
+                if h.get('name', '').lower() == name.lower():
+                    return h.get('value')
+            return None
+
+        remitente = _h('From') or ''
+        to_orig = _h('To') or ''
+        cc_orig = _h('Cc') or ''
+        asunto_orig = _h('Subject') or ''
+        msg_id_hdr = _h('Message-Id')
+        refs = _h('References')
+
+        destinatarios = []
+        vistos = set()
+        yo_l = yo.strip().lower()
+        for nombre, correo in getaddresses([remitente, to_orig, cc_orig]):
+            correo_l = (correo or '').strip().lower()
+            if not correo_l or correo_l == yo_l or correo_l in vistos:
+                continue
+            vistos.add(correo_l)
+            destinatarios.append(formataddr((nombre, correo)))
+
+        para = ', '.join(destinatarios)
+        asunto = asunto_orig if asunto_orig.lower().startswith('re:') else 'Re: ' + asunto_orig
+        msg = MIMEText(texto, 'plain', 'utf-8')
+        msg['To'] = para
+        msg['Subject'] = asunto
+        if msg_id_hdr:
+            msg['In-Reply-To'] = msg_id_hdr
+            msg['References'] = (refs + ' ' + msg_id_hdr) if refs else msg_id_hdr
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        enviado = svc.users().messages().send(
+            userId='me', body={'raw': raw, 'threadId': thread_id}).execute()
+        _audit("gmail_responder_a_todos",
+               {"message_id": message_id, "para": para, "asunto": asunto, "id": enviado.get('id')})
+        return {"ok": True, "id": enviado.get('id'), "threadId": enviado.get('threadId'), "para": para}
+    except Exception as e:
+        return _err("gmail_responder_a_todos", e)
+
+
+@mcp.tool()
+def gmail_reenviar(message_id: str, para: str, comentario: str = ''):
+    """Reenvia un correo a un nuevo destinatario.
+
+    Recupera el mensaje original (asunto, cabeceras From/To/Date y cuerpo de
+    texto plano), compone un mensaje nuevo dirigido a 'para' con asunto 'Fwd:'
+    y cuerpo formado por el comentario opcional seguido de una cabecera de
+    reenvio y del texto original. No re-adjunta binarios; si el original tenia
+    adjuntos se indica en el cuerpo. Devuelve el id del mensaje enviado.
+    """
+    try:
+        from email.mime.text import MIMEText
+        svc = _get_gmail()
+        m = svc.users().messages().get(userId='me', id=message_id, format='full').execute()
+        payload = m.get('payload', {})
+        headers = payload.get('headers', [])
+
+        def _h(name):
+            for h in headers:
+                if h.get('name', '').lower() == name.lower():
+                    return h.get('value')
+            return ''
+
+        asunto_orig = _h('Subject')
+
+        def _walk(part):
+            piezas = [part]
+            for sub in part.get('parts', []) or []:
+                piezas.extend(_walk(sub))
+            return piezas
+
+        texto = ''
+        tiene_adjuntos = False
+        for p in _walk(payload):
+            fn = p.get('filename')
+            body = p.get('body', {})
+            if fn:
+                tiene_adjuntos = True
+            elif p.get('mimeType') == 'text/plain' and body.get('data'):
+                texto += base64.urlsafe_b64decode(body['data']).decode('utf-8', 'replace')
+
+        cabecera_orig = (
+            "De: {de}\n"
+            "Fecha: {fecha}\n"
+            "Para: {a}\n"
+            "Asunto: {asunto}\n"
+        ).format(de=_h('From'), fecha=_h('Date'), a=_h('To'), asunto=asunto_orig)
+
+        cuerpo = ''
+        if comentario:
+            cuerpo += comentario + '\n\n'
+        cuerpo += '---------- Mensaje reenviado ----------\n'
+        cuerpo += cabecera_orig + '\n' + texto
+        if tiene_adjuntos:
+            cuerpo += '\n\n[El mensaje original contenia adjuntos que no se han reenviado.]'
+
+        asunto = asunto_orig if asunto_orig.lower().startswith('fwd:') else 'Fwd: ' + asunto_orig
+        msg = MIMEText(cuerpo, 'plain', 'utf-8')
+        msg['To'] = para
+        msg['Subject'] = asunto
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        enviado = svc.users().messages().send(userId='me', body={'raw': raw}).execute()
+        _audit("gmail_reenviar",
+               {"message_id": message_id, "para": para, "asunto": asunto, "id": enviado.get('id')})
+        return {"ok": True, "id": enviado.get('id'), "threadId": enviado.get('threadId')}
+    except Exception as e:
+        return _err("gmail_reenviar", e)
+
+
+@mcp.tool()
+def gmail_a_papelera(message_id: str):
+    """Mueve un correo a la papelera de Gmail (messages().trash). Devuelve el id y las etiquetas resultantes."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().messages().trash(userId='me', id=message_id).execute()
+        _audit("gmail_a_papelera", {"message_id": message_id})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_a_papelera", e)
+
+
+@mcp.tool()
+def gmail_restaurar_de_papelera(message_id: str):
+    """Restaura un correo desde la papelera de Gmail (messages().untrash). Devuelve el id y las etiquetas resultantes."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().messages().untrash(userId='me', id=message_id).execute()
+        _audit("gmail_restaurar_de_papelera", {"message_id": message_id})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_restaurar_de_papelera", e)
+
+
+@mcp.tool()
+def gmail_eliminar_definitivo(message_id: str, confirm: bool = False):
+    """Elimina un correo de forma DEFINITIVA e irreversible (messages().delete).
+
+    Por seguridad, si confirm es False no borra nada y devuelve un error pidiendo
+    volver a llamar con confirm=True. Con confirm=True elimina el mensaje sin
+    posibilidad de recuperacion.
+    """
+    try:
+        if not confirm:
+            return {"ok": False, "error": "Accion irreversible: vuelve a llamar con confirm=True para eliminar definitivamente el mensaje."}
+        svc = _get_gmail()
+        svc.users().messages().delete(userId='me', id=message_id).execute()
+        _audit("gmail_eliminar_definitivo", {"message_id": message_id})
+        return {"ok": True, "id": message_id, "eliminado": True}
+    except Exception as e:
+        return _err("gmail_eliminar_definitivo", e)
+
+
+@mcp.tool()
+def gmail_destacar(message_id: str, destacar: bool = True):
+    """Destaca o quita el destacado de un correo (etiqueta 'STARRED') mediante messages().modify.
+
+    Si destacar es True anade la etiqueta STARRED; si es False la elimina.
+    """
+    try:
+        svc = _get_gmail()
+        if destacar:
+            body = {'addLabelIds': ['STARRED']}
+        else:
+            body = {'removeLabelIds': ['STARRED']}
+        res = svc.users().messages().modify(userId='me', id=message_id, body=body).execute()
+        _audit("gmail_destacar", {"message_id": message_id, "destacar": destacar})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_destacar", e)
+
+
+@mcp.tool()
+def gmail_marcar_spam(message_id: str, es_spam: bool = True):
+    """Marca o desmarca un correo como spam mediante messages().modify.
+
+    Si es_spam es True anade la etiqueta 'SPAM' y quita 'INBOX'; si es False
+    quita 'SPAM' (devolviendo el mensaje fuera de la carpeta de spam).
+    """
+    try:
+        svc = _get_gmail()
+        if es_spam:
+            body = {'addLabelIds': ['SPAM'], 'removeLabelIds': ['INBOX']}
+        else:
+            body = {'removeLabelIds': ['SPAM']}
+        res = svc.users().messages().modify(userId='me', id=message_id, body=body).execute()
+        _audit("gmail_marcar_spam", {"message_id": message_id, "es_spam": es_spam})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_marcar_spam", e)
+
+
+@mcp.tool()
+def gmail_quitar_de_carpeta(message_id: str, carpeta: str):
+    """Quita un correo de una carpeta/etiqueta identificada por su NOMBRE.
+
+    Busca la etiqueta por nombre en labels().list; si existe, la elimina del
+    mensaje con messages().modify (removeLabelIds). Si no existe la etiqueta,
+    devuelve un error indicandolo.
+    """
+    try:
+        svc = _get_gmail()
+        etiquetas = svc.users().labels().list(userId='me').execute().get('labels', [])
+        label_id = None
+        for lab in etiquetas:
+            if (lab.get('name', '') or '').lower() == carpeta.strip().lower():
+                label_id = lab.get('id')
+                break
+        if not label_id:
+            return {"ok": False, "error": "No existe ninguna etiqueta llamada '{}'.".format(carpeta)}
+        res = svc.users().messages().modify(
+            userId='me', id=message_id, body={'removeLabelIds': [label_id]}).execute()
+        _audit("gmail_quitar_de_carpeta",
+               {"message_id": message_id, "carpeta": carpeta, "label_id": label_id})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_quitar_de_carpeta", e)
+
+
+
+# ============================================================
+# BLOQUE: Gmail avanzado (PDF, adjuntos, fuera de oficina)
+# ============================================================
+
+@mcp.tool()
+def gmail_guardar_como_pdf(message_id: str, parent_id: str = 'root', incluir_hilo: bool = False, nombre: Optional[str] = None) -> str:
+    """Guarda un correo de Gmail (o el hilo completo) como PDF en Google Drive.
+
+    Obtiene el mensaje indicado o, si `incluir_hilo` es True, todos los mensajes del
+    hilo. De cada mensaje extrae las cabeceras From, To, Date y Subject junto con el
+    texto plano (text/plain), genera un PDF con reportlab (canvas sobre A4, con saltos
+    de linea y control de fin de pagina) y lo sube a la carpeta `parent_id` de Drive.
+    El nombre sera `nombre` o el asunto del primer mensaje mas '.pdf'. Devuelve el id
+    del fichero creado en Drive.
+    """
+    try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import A4
+        import base64
+        import textwrap
+
+        svc = _get_gmail()
+
+        def _leer_cabecera(headers, nombre_h):
+            for h in headers or []:
+                if h.get('name', '').lower() == nombre_h.lower():
+                    return h.get('value', '')
+            return ''
+
+        def _extraer_texto(payload):
+            partes_texto = []
+
+            def _recorrer(part):
+                mime = part.get('mimeType', '') or ''
+                body = part.get('body', {}) or {}
+                data = body.get('data')
+                if mime == 'text/plain' and data:
+                    try:
+                        partes_texto.append(
+                            base64.urlsafe_b64decode(data.encode('utf-8')).decode('utf-8', errors='replace')
+                        )
+                    except Exception:
+                        pass
+                for sub in part.get('parts', []) or []:
+                    _recorrer(sub)
+
+            _recorrer(payload)
+            return '\n'.join(partes_texto)
+
+        if incluir_hilo:
+            base_msg = svc.users().messages().get(userId='me', id=message_id, format='full').execute()
+            thread_id = base_msg.get('threadId')
+            hilo = svc.users().threads().get(userId='me', id=thread_id, format='full').execute()
+            mensajes = hilo.get('messages', []) or []
+        else:
+            mensajes = [svc.users().messages().get(userId='me', id=message_id, format='full').execute()]
+
+        primer_payload = (mensajes[0].get('payload') if mensajes else {}) or {}
+        asunto = _leer_cabecera(primer_payload.get('headers'), 'Subject') or 'correo'
+
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        ancho, alto = A4
+        margen = 50
+        y = alto - margen
+
+        def _nueva_pagina():
+            nonlocal y
+            c.showPage()
+            y = alto - margen
+
+        def _escribir_linea(texto, fuente='Helvetica', tam=10):
+            nonlocal y
+            if y < margen:
+                _nueva_pagina()
+            c.setFont(fuente, tam)
+            c.drawString(margen, y, texto)
+            y -= (tam + 4)
+
+        for idx, m in enumerate(mensajes):
+            payload = m.get('payload', {}) or {}
+            headers = payload.get('headers', [])
+            if idx > 0:
+                _escribir_linea('-' * 80)
+                _escribir_linea('')
+            _escribir_linea('De: ' + _leer_cabecera(headers, 'From'), 'Helvetica-Bold', 10)
+            _escribir_linea('Para: ' + _leer_cabecera(headers, 'To'), 'Helvetica-Bold', 10)
+            _escribir_linea('Fecha: ' + _leer_cabecera(headers, 'Date'), 'Helvetica-Bold', 10)
+            _escribir_linea('Asunto: ' + _leer_cabecera(headers, 'Subject'), 'Helvetica-Bold', 10)
+            _escribir_linea('')
+            cuerpo = _extraer_texto(payload)
+            for parrafo in cuerpo.split('\n'):
+                if not parrafo:
+                    _escribir_linea('')
+                    continue
+                for linea in textwrap.wrap(parrafo, width=95):
+                    _escribir_linea(linea, 'Helvetica', 10)
+            _escribir_linea('')
+
+        c.showPage()
+        c.save()
+        buffer.seek(0)
+
+        nombre_final = nombre or (asunto + '.pdf')
+        if not nombre_final.lower().endswith('.pdf'):
+            nombre_final = nombre_final + '.pdf'
+
+        drive = _get_service()
+        media = MediaIoBaseUpload(buffer, mimetype='application/pdf', resumable=False)
+        creado = drive.files().create(
+            body={'name': nombre_final, 'parents': [parent_id]},
+            media_body=media,
+            fields='id',
+            supportsAllDrives=True,
+        ).execute()
+        file_id = creado.get('id')
+        _audit('gmail_guardar_como_pdf', 'message=%s hilo=%s -> drive=%s' % (message_id, incluir_hilo, file_id))
+        return file_id
+    except Exception as e:
+        return _err('gmail_guardar_como_pdf', e)
+
+
+@mcp.tool()
+def gmail_leer_adjunto(message_id: str, nombre_adjunto: str, max_chars: int = 20000) -> str:
+    """Lee el contenido textual de un adjunto de un correo de Gmail sin guardarlo en Drive.
+
+    Recorre las partes del mensaje buscando el adjunto cuyo filename coincide con (o
+    contiene) `nombre_adjunto`, lo descarga con attachments().get y, si es PDF, extrae
+    el texto con pypdf; si es texto, lo decodifica. Devuelve el texto (truncado a
+    `max_chars`). Si el adjunto es binario no legible, lo indica.
+    """
+    try:
+        import base64
+
+        svc = _get_gmail()
+        msg = svc.users().messages().get(userId='me', id=message_id, format='full').execute()
+        payload = msg.get('payload', {}) or {}
+
+        encontrado = {}
+
+        def _buscar(part):
+            if encontrado:
+                return
+            filename = part.get('filename', '') or ''
+            if filename and (
+                nombre_adjunto.lower() == filename.lower() or nombre_adjunto.lower() in filename.lower()
+            ):
+                encontrado['filename'] = filename
+                encontrado['mimeType'] = part.get('mimeType', '') or ''
+                encontrado['body'] = part.get('body', {}) or {}
+                return
+            for sub in part.get('parts', []) or []:
+                _buscar(sub)
+
+        _buscar(payload)
+
+        if not encontrado:
+            return 'No se encontro ningun adjunto que coincida con: %s' % nombre_adjunto
+
+        body = encontrado['body']
+        data = body.get('data')
+        if not data and body.get('attachmentId'):
+            adj = svc.users().messages().attachments().get(
+                userId='me', messageId=message_id, id=body['attachmentId']
+            ).execute()
+            data = adj.get('data')
+
+        if not data:
+            return 'El adjunto "%s" no contiene datos descargables.' % encontrado['filename']
+
+        contenido = base64.urlsafe_b64decode(data.encode('utf-8'))
+        filename = encontrado['filename']
+        mime = encontrado['mimeType']
+
+        texto = ''
+        if filename.lower().endswith('.pdf') or 'pdf' in mime.lower():
+            from pypdf import PdfReader
+            lector = PdfReader(io.BytesIO(contenido))
+            paginas = []
+            for pag in lector.pages:
+                try:
+                    paginas.append(pag.extract_text() or '')
+                except Exception:
+                    pass
+            texto = '\n'.join(paginas)
+        else:
+            try:
+                texto = contenido.decode('utf-8')
+            except Exception:
+                try:
+                    texto = contenido.decode('latin-1')
+                except Exception:
+                    texto = ''
+
+        if not texto.strip():
+            return 'El adjunto "%s" (%s) es binario o no legible como texto.' % (filename, mime)
+
+        if len(texto) > max_chars:
+            texto = texto[:max_chars] + '\n[...truncado...]'
+        return texto
+    except Exception as e:
+        return _err('gmail_leer_adjunto', e)
+
+
+@mcp.tool()
+def gmail_fuera_de_oficina(activar: bool, asunto: str = '', mensaje: str = '', desde: Optional[str] = None, hasta: Optional[str] = None) -> str:
+    """Activa o desactiva la respuesta automatica de vacaciones (fuera de oficina) en Gmail.
+
+    Si `activar` es True, habilita enableAutoReply con responseSubject (`asunto`),
+    responseBodyPlainText (`mensaje`) y, si se aportan fechas AAAA-MM-DD (`desde`/`hasta`),
+    startTime/endTime en milisegundos epoch. Si `activar` es False, deshabilita la
+    respuesta automatica. Devuelve el estado resultante.
+    """
+    try:
+        import datetime
+
+        svc = _get_gmail()
+        body = {'enableAutoReply': bool(activar)}
+
+        if activar:
+            body['responseSubject'] = asunto
+            body['responseBodyPlainText'] = mensaje
+
+            def _a_ms_inicio(fecha):
+                dt = datetime.datetime.strptime(fecha, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
+                return int(dt.timestamp() * 1000)
+
+            if desde:
+                body['startTime'] = _a_ms_inicio(desde)
+            if hasta:
+                dt_fin = datetime.datetime.strptime(hasta, '%Y-%m-%d').replace(tzinfo=datetime.timezone.utc)
+                dt_fin = dt_fin + datetime.timedelta(days=1) - datetime.timedelta(milliseconds=1)
+                body['endTime'] = int(dt_fin.timestamp() * 1000)
+
+        resultado = svc.users().settings().updateVacation(userId='me', body=body).execute()
+        _audit('gmail_fuera_de_oficina', 'activar=%s desde=%s hasta=%s' % (activar, desde, hasta))
+        estado = 'activada' if resultado.get('enableAutoReply') else 'desactivada'
+        return 'Respuesta automatica %s. Asunto: %s' % (estado, resultado.get('responseSubject', ''))
+    except Exception as e:
+        return _err('gmail_fuera_de_oficina', e)
+
+
+@mcp.tool()
+def gmail_estado_fuera_oficina() -> str:
+    """Consulta el estado de la respuesta automatica de vacaciones (fuera de oficina) en Gmail.
+
+    Lee settings().getVacation y devuelve si esta activa, junto con el asunto y el
+    mensaje configurados.
+    """
+    try:
+        svc = _get_gmail()
+        vac = svc.users().settings().getVacation(userId='me').execute()
+        activo = bool(vac.get('enableAutoReply'))
+        return 'Fuera de oficina: %s\nAsunto: %s\nMensaje: %s' % (
+            'ACTIVO' if activo else 'INACTIVO',
+            vac.get('responseSubject', ''),
+            vac.get('responseBodyPlainText', ''),
+        )
+    except Exception as e:
+        return _err('gmail_estado_fuera_oficina', e)
+
+
+# =========================================================================
+# BLOQUE: Calendar avanzado (usa _get_cal()). Se APPENDEA a server.py.
+# No incluye imports de nivel modulo ni redefine helpers existentes.
+# =========================================================================
+
+
+@mcp.tool()
+def calendar_crear_evento_recurrente(summary: str, start: str, end: str, recurrencia: str,
+                                     veces: Optional[int] = None, hasta: Optional[str] = None,
+                                     descripcion: str = '', attendees: Optional[list] = None,
+                                     con_meet: bool = False, calendar_id: str = 'primary'):
+    """Crea un evento recurrente en Google Calendar.
+
+    Construye la RRULE a partir de `recurrencia` ('DIARIA'|'SEMANAL'|'MENSUAL'|'ANUAL'),
+    anadiendo COUNT=`veces` o UNTIL=`hasta` (formato AAAAMMDD). Los parametros `start` y `end`
+    van en RFC3339. Si `con_meet` es True se anade una videollamada de Google Meet.
+    Devuelve el id del evento y el enlace (htmlLink).
+    """
+    import datetime
+    import uuid
+    try:
+        cal = _get_cal()
+        mapa = {'DIARIA': 'DAILY', 'SEMANAL': 'WEEKLY', 'MENSUAL': 'MONTHLY', 'ANUAL': 'YEARLY'}
+        freq = mapa.get(recurrencia.upper())
+        if not freq:
+            return _err('calendar_crear_evento_recurrente',
+                        ValueError("recurrencia debe ser DIARIA|SEMANAL|MENSUAL|ANUAL"))
+        rrule = "RRULE:FREQ=" + freq
+        if veces is not None:
+            rrule += ";COUNT=" + str(int(veces))
+        elif hasta:
+            rrule += ";UNTIL=" + str(hasta)
+        cuerpo = {
+            'summary': summary,
+            'description': descripcion,
+            'start': {'dateTime': start},
+            'end': {'dateTime': end},
+            'recurrence': [rrule],
+        }
+        if attendees:
+            cuerpo['attendees'] = [{'email': a} for a in attendees]
+        params = {'calendarId': calendar_id, 'body': cuerpo}
+        if con_meet:
+            cuerpo['conferenceData'] = {
+                'createRequest': {
+                    'requestId': str(uuid.uuid4()),
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'},
+                }
+            }
+            params['conferenceDataVersion'] = 1
+        ev = cal.events().insert(**params).execute()
+        _audit('calendar_crear_evento_recurrente',
+               "id=%s summary=%s rrule=%s" % (ev.get('id'), summary, rrule))
+        return {'id': ev.get('id'), 'link': ev.get('htmlLink')}
+    except Exception as e:
+        return _err('calendar_crear_evento_recurrente', e)
+
+
+@mcp.tool()
+def calendar_crear_evento_todo_el_dia(summary: str, fecha: str, fecha_fin: Optional[str] = None,
+                                      descripcion: str = '', calendar_id: str = 'primary'):
+    """Crea un evento de dia completo (all-day) en Google Calendar.
+
+    Usa start={'date': `fecha`} y end={'date': `fecha_fin`}. Si `fecha_fin` no se indica,
+    se toma el dia siguiente a `fecha` (las fechas van en formato AAAA-MM-DD).
+    Devuelve el id del evento y el enlace (htmlLink).
+    """
+    import datetime
+    import uuid
+    try:
+        cal = _get_cal()
+        if fecha_fin:
+            fin = fecha_fin
+        else:
+            d = datetime.date.fromisoformat(fecha)
+            fin = (d + datetime.timedelta(days=1)).isoformat()
+        cuerpo = {
+            'summary': summary,
+            'description': descripcion,
+            'start': {'date': fecha},
+            'end': {'date': fin},
+        }
+        ev = cal.events().insert(calendarId=calendar_id, body=cuerpo).execute()
+        _audit('calendar_crear_evento_todo_el_dia',
+               "id=%s summary=%s %s->%s" % (ev.get('id'), summary, fecha, fin))
+        return {'id': ev.get('id'), 'link': ev.get('htmlLink')}
+    except Exception as e:
+        return _err('calendar_crear_evento_todo_el_dia', e)
+
+
+@mcp.tool()
+def calendar_listar_calendarios():
+    """Lista los calendarios disponibles del usuario.
+
+    Recorre calendarList().list() y devuelve, por cada calendario, su id, el resumen
+    (summary) y si es el calendario principal (primary).
+    """
+    import datetime
+    import uuid
+    try:
+        cal = _get_cal()
+        salida = []
+        page_token = None
+        while True:
+            resp = cal.calendarList().list(pageToken=page_token).execute()
+            for c in resp.get('items', []):
+                salida.append({
+                    'id': c.get('id'),
+                    'resumen': c.get('summary'),
+                    'principal': bool(c.get('primary', False)),
+                })
+            page_token = resp.get('nextPageToken')
+            if not page_token:
+                break
+        return salida
+    except Exception as e:
+        return _err('calendar_listar_calendarios', e)
+
+
+@mcp.tool()
+def calendar_anadir_meet(event_id: str, calendar_id: str = 'primary'):
+    """Anade una videollamada de Google Meet a un evento existente.
+
+    Hace patch del evento con conferenceData (createRequest, conferenceSolutionKey
+    hangoutsMeet y requestId uuid) usando conferenceDataVersion=1.
+    Devuelve el enlace de Meet asociado al evento.
+    """
+    import datetime
+    import uuid
+    try:
+        cal = _get_cal()
+        cuerpo = {
+            'conferenceData': {
+                'createRequest': {
+                    'requestId': str(uuid.uuid4()),
+                    'conferenceSolutionKey': {'type': 'hangoutsMeet'},
+                }
+            }
+        }
+        ev = cal.events().patch(calendarId=calendar_id, eventId=event_id,
+                                body=cuerpo, conferenceDataVersion=1).execute()
+        enlace = ev.get('hangoutLink')
+        if not enlace:
+            for ep in ev.get('conferenceData', {}).get('entryPoints', []):
+                if ep.get('entryPointType') == 'video':
+                    enlace = ep.get('uri')
+                    break
+        _audit('calendar_anadir_meet', "event_id=%s meet=%s" % (event_id, enlace))
+        return {'event_id': event_id, 'meet': enlace}
+    except Exception as e:
+        return _err('calendar_anadir_meet', e)
+
+
+@mcp.tool()
+def calendar_proponer_huecos(fecha: str, duracion_min: int = 30, hora_ini: str = '09:00',
+                             hora_fin: str = '18:00', calendar_id: str = 'primary'):
+    """Propone huecos libres en la agenda para un dia concreto.
+
+    Consulta freebusy en `fecha` (AAAA-MM-DD) entre `hora_ini` y `hora_fin` (horas locales),
+    calcula los tramos LIBRES de al menos `duracion_min` minutos y devuelve hasta 3 huecos
+    propuestos, cada uno con inicio y fin en RFC3339.
+    """
+    import datetime
+    import uuid
+    try:
+        cal = _get_cal()
+        tz = datetime.datetime.now().astimezone().tzinfo
+        d = datetime.date.fromisoformat(fecha)
+        hi_h, hi_m = [int(x) for x in hora_ini.split(':')]
+        hf_h, hf_m = [int(x) for x in hora_fin.split(':')]
+        ini = datetime.datetime(d.year, d.month, d.day, hi_h, hi_m, tzinfo=tz)
+        fin = datetime.datetime(d.year, d.month, d.day, hf_h, hf_m, tzinfo=tz)
+
+        body = {
+            'timeMin': ini.isoformat(),
+            'timeMax': fin.isoformat(),
+            'items': [{'id': calendar_id}],
+        }
+        fb = cal.freebusy().query(body=body).execute()
+        ocupados = fb.get('calendars', {}).get(calendar_id, {}).get('busy', [])
+
+        def _parse(v):
+            return datetime.datetime.fromisoformat(v.replace('Z', '+00:00')).astimezone(tz)
+
+        tramos = []
+        for b in ocupados:
+            bs = max(_parse(b['start']), ini)
+            be = min(_parse(b['end']), fin)
+            if be > bs:
+                tramos.append((bs, be))
+        tramos.sort(key=lambda t: t[0])
+
+        # Fusiona solapamientos
+        fusion = []
+        for bs, be in tramos:
+            if fusion and bs <= fusion[-1][1]:
+                fusion[-1] = (fusion[-1][0], max(fusion[-1][1], be))
+            else:
+                fusion.append((bs, be))
+
+        dur = datetime.timedelta(minutes=int(duracion_min))
+        huecos = []
+        cursor = ini
+        for bs, be in fusion:
+            if bs - cursor >= dur:
+                huecos.append({'inicio': cursor.isoformat(),
+                               'fin': (cursor + dur).isoformat()})
+            if be > cursor:
+                cursor = be
+            if len(huecos) >= 3:
+                break
+        if len(huecos) < 3 and fin - cursor >= dur:
+            huecos.append({'inicio': cursor.isoformat(),
+                           'fin': (cursor + dur).isoformat()})
+        return huecos[:3]
+    except Exception as e:
+        return _err('calendar_proponer_huecos', e)
+
+
+
+
+# ======================================================================
+# BLOQUE: Google Tasks avanzado (helpers _get_tasks / _err / _audit)
+# ======================================================================
+
+
+@mcp.tool()
+def tasks_listas() -> dict:
+    """Lista todas las listas de tareas de Google Tasks.
+
+    Devuelve el id y el titulo de cada lista de tareas del usuario.
+    """
+    try:
+        service = _get_tasks()
+        resultado = service.tasklists().list().execute()
+        listas = [
+            {"id": item.get("id"), "titulo": item.get("title")}
+            for item in resultado.get("items", [])
+        ]
+        return {"ok": True, "listas": listas}
+    except Exception as e:
+        return _err("tasks_listas", e)
+
+
+@mcp.tool()
+def tasks_crear_lista(titulo: str) -> dict:
+    """Crea una nueva lista de tareas en Google Tasks.
+
+    Args:
+        titulo: Titulo de la nueva lista de tareas.
+
+    Devuelve el id de la lista creada.
+    """
+    try:
+        service = _get_tasks()
+        creada = service.tasklists().insert(body={"title": titulo}).execute()
+        list_id = creada.get("id")
+        _audit("tasks_crear_lista", f"titulo={titulo} id={list_id}")
+        return {"ok": True, "id": list_id, "titulo": creada.get("title")}
+    except Exception as e:
+        return _err("tasks_crear_lista", e)
+
+
+@mcp.tool()
+def tasks_editar(
+    task_id: str,
+    titulo: Optional[str] = None,
+    fecha: Optional[str] = None,
+    notas: Optional[str] = None,
+    tasklist: str = "@default",
+) -> dict:
+    """Edita una tarea existente de Google Tasks.
+
+    Aplica un patch con los campos no nulos. La fecha en formato
+    AAAA-MM-DD se convierte a 'due' RFC3339 (T00:00:00.000Z).
+
+    Args:
+        task_id: Identificador de la tarea a editar.
+        titulo: Nuevo titulo (opcional).
+        fecha: Nueva fecha de vencimiento AAAA-MM-DD (opcional).
+        notas: Nuevas notas (opcional).
+        tasklist: Lista de tareas donde reside la tarea.
+
+    Devuelve la tarea actualizada.
+    """
+    try:
+        service = _get_tasks()
+        body: dict = {}
+        if titulo is not None:
+            body["title"] = titulo
+        if notas is not None:
+            body["notes"] = notas
+        if fecha is not None:
+            body["due"] = fecha + "T00:00:00.000Z"
+        actualizada = service.tasks().patch(
+            tasklist=tasklist, task=task_id, body=body
+        ).execute()
+        _audit("tasks_editar", f"task_id={task_id} campos={list(body.keys())}")
+        return {"ok": True, "tarea": actualizada}
+    except Exception as e:
+        return _err("tasks_editar", e)
+
+
+@mcp.tool()
+def tasks_eliminar(task_id: str, tasklist: str = "@default") -> dict:
+    """Elimina una tarea de Google Tasks.
+
+    Args:
+        task_id: Identificador de la tarea a eliminar.
+        tasklist: Lista de tareas donde reside la tarea.
+
+    Devuelve confirmacion de borrado.
+    """
+    try:
+        service = _get_tasks()
+        service.tasks().delete(tasklist=tasklist, task=task_id).execute()
+        _audit("tasks_eliminar", f"task_id={task_id} tasklist={tasklist}")
+        return {"ok": True, "task_id": task_id}
+    except Exception as e:
+        return _err("tasks_eliminar", e)
+
+
+@mcp.tool()
+def tasks_mover(
+    task_id: str,
+    tasklist_destino: str,
+    tasklist_origen: str = "@default",
+) -> dict:
+    """Mueve una tarea de una lista de tareas a otra.
+
+    Recupera la tarea de origen, la inserta en la lista de destino
+    conservando titulo, notas y fecha de vencimiento, y elimina la
+    tarea original.
+
+    Args:
+        task_id: Identificador de la tarea a mover.
+        tasklist_destino: Lista de tareas de destino.
+        tasklist_origen: Lista de tareas de origen.
+
+    Devuelve el nuevo id de la tarea creada en el destino.
+    """
+    try:
+        service = _get_tasks()
+        original = service.tasks().get(
+            tasklist=tasklist_origen, task=task_id
+        ).execute()
+        body: dict = {"title": original.get("title", "")}
+        if original.get("notes"):
+            body["notes"] = original["notes"]
+        if original.get("due"):
+            body["due"] = original["due"]
+        nueva = service.tasks().insert(
+            tasklist=tasklist_destino, body=body
+        ).execute()
+        service.tasks().delete(
+            tasklist=tasklist_origen, task=task_id
+        ).execute()
+        nuevo_id = nueva.get("id")
+        _audit(
+            "tasks_mover",
+            f"task_id={task_id} origen={tasklist_origen} "
+            f"destino={tasklist_destino} nuevo_id={nuevo_id}",
+        )
+        return {"ok": True, "id": nuevo_id}
+    except Exception as e:
+        return _err("tasks_mover", e)
+
+
+@mcp.tool()
+def tasks_crear_subtarea(
+    task_id_padre: str,
+    titulo: str,
+    notas: str = "",
+    tasklist: str = "@default",
+) -> dict:
+    """Crea una subtarea colgada de una tarea padre en Google Tasks.
+
+    Args:
+        task_id_padre: Identificador de la tarea padre.
+        titulo: Titulo de la subtarea.
+        notas: Notas de la subtarea (opcional).
+        tasklist: Lista de tareas donde reside la tarea padre.
+
+    Devuelve el id de la subtarea creada.
+    """
+    try:
+        service = _get_tasks()
+        creada = service.tasks().insert(
+            tasklist=tasklist,
+            parent=task_id_padre,
+            body={"title": titulo, "notes": notas},
+        ).execute()
+        sub_id = creada.get("id")
+        _audit(
+            "tasks_crear_subtarea",
+            f"padre={task_id_padre} id={sub_id} titulo={titulo}",
+        )
+        return {"ok": True, "id": sub_id}
+    except Exception as e:
+        return _err("tasks_crear_subtarea", e)
+
+
+# =============================================================================
+# BLOQUE: Contactos ESCRITURA (People API v1) — requiere scope de escritura
+# =============================================================================
+
+
+@mcp.tool()
+def contactos_crear(
+    nombre: str,
+    email: Optional[str] = None,
+    telefono: Optional[str] = None,
+    empresa: Optional[str] = None,
+) -> dict:
+    """Crea un contacto nuevo en Google Contacts (People API).
+
+    Parámetros:
+        nombre: Nombre a mostrar del contacto (obligatorio).
+        email: Dirección de correo electrónico (opcional).
+        telefono: Número de teléfono (opcional).
+        empresa: Nombre de la organización o empresa (opcional).
+
+    Devuelve un diccionario con el resourceName y el nombre del contacto creado.
+    """
+    try:
+        people = _get_people()
+        body: dict = {
+            "names": [{"givenName": nombre, "displayName": nombre}],
+        }
+        if email:
+            body["emailAddresses"] = [{"value": email}]
+        if telefono:
+            body["phoneNumbers"] = [{"value": telefono}]
+        if empresa:
+            body["organizations"] = [{"name": empresa}]
+
+        resultado = people.people().createContact(body=body).execute()
+        resource_name = resultado.get("resourceName")
+        _audit("contactos_crear", f"nombre={nombre} resourceName={resource_name}")
+        return {"ok": True, "resourceName": resource_name, "nombre": nombre}
+    except Exception as e:
+        return _err("contactos_crear", e)
+
+
+@mcp.tool()
+def contactos_editar(
+    resource_name: str,
+    nombre: Optional[str] = None,
+    email: Optional[str] = None,
+    telefono: Optional[str] = None,
+) -> dict:
+    """Edita un contacto existente en Google Contacts (People API).
+
+    Obtiene primero el etag del contacto y actualiza únicamente los campos
+    indicados (nombre, email y/o teléfono).
+
+    Parámetros:
+        resource_name: Identificador del contacto (p. ej. 'people/c123...').
+        nombre: Nuevo nombre a mostrar (opcional).
+        email: Nueva dirección de correo (opcional).
+        telefono: Nuevo número de teléfono (opcional).
+
+    Devuelve un diccionario con ok=True si la actualización se realiza.
+    """
+    try:
+        people = _get_people()
+        actual = (
+            people.people()
+            .get(
+                resourceName=resource_name,
+                personFields="names,emailAddresses,phoneNumbers,metadata",
+            )
+            .execute()
+        )
+        etag = actual.get("etag")
+
+        campos = []
+        body: dict = {"etag": etag}
+        if nombre is not None:
+            body["names"] = [{"givenName": nombre, "displayName": nombre}]
+            campos.append("names")
+        if email is not None:
+            body["emailAddresses"] = [{"value": email}]
+            campos.append("emailAddresses")
+        if telefono is not None:
+            body["phoneNumbers"] = [{"value": telefono}]
+            campos.append("phoneNumbers")
+
+        if not campos:
+            return _err(
+                "contactos_editar",
+                ValueError("No se indicó ningún campo a modificar."),
+            )
+
+        people.people().updateContact(
+            resourceName=resource_name,
+            updatePersonFields=",".join(campos),
+            body=body,
+        ).execute()
+        _audit(
+            "contactos_editar",
+            f"resourceName={resource_name} campos={','.join(campos)}",
+        )
+        return {"ok": True, "resourceName": resource_name}
+    except Exception as e:
+        return _err("contactos_editar", e)
+
+
+@mcp.tool()
+def contactos_eliminar(resource_name: str, confirm: bool = False) -> dict:
+    """Elimina un contacto de Google Contacts (People API).
+
+    Por seguridad requiere confirmación explícita.
+
+    Parámetros:
+        resource_name: Identificador del contacto (p. ej. 'people/c123...').
+        confirm: Debe ser True para ejecutar el borrado; si es False se aborta.
+
+    Devuelve un diccionario con ok=True si el contacto se elimina.
+    """
+    try:
+        if not confirm:
+            return _err(
+                "contactos_eliminar",
+                ValueError(
+                    "Operación no confirmada: vuelve a llamar con confirm=True "
+                    "para eliminar el contacto."
+                ),
+            )
+        people = _get_people()
+        people.people().deleteContact(resourceName=resource_name).execute()
+        _audit("contactos_eliminar", f"resourceName={resource_name}")
+        return {"ok": True, "resourceName": resource_name}
+    except Exception as e:
+        return _err("contactos_eliminar", e)
+
+
+
+# --------------------------------------------------------------------------- #
+# COMANDOS COMBINADOS DEL DIA (bandeja y agenda)
+# --------------------------------------------------------------------------- #
+
+
+@mcp.tool()
+def bandeja_del_dia(max_correos: int = 15) -> dict:
+    """Reune la bandeja del dia: correos de Gmail no leidos y recientes
+    (ultimos 2 dias) y tareas de Google Tasks vencidas o que vencen hoy.
+
+    Args:
+        max_correos: Numero maximo de correos no leidos a devolver.
+
+    Devuelve un dict con 'correos_no_leidos' (lista con remitente, asunto y
+    fecha de cada correo) y 'tareas_pendientes' (tareas con vencimiento <= hoy
+    que no esten completadas).
+    """
+    try:
+        import datetime as _dt
+        gmail = _get_gmail()
+        tasks = _get_tasks()
+
+        # (a) Correos no leidos recientes (ultimos 2 dias)
+        correos = []
+        res = gmail.users().messages().list(
+            userId="me", q="is:unread newer_than:2d",
+            maxResults=max(1, min(max_correos, 100)),
+        ).execute()
+        for m in res.get("messages", []):
+            full = gmail.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            h = {x["name"]: x["value"]
+                 for x in full.get("payload", {}).get("headers", [])}
+            correos.append({
+                "id": m["id"],
+                "de": h.get("From"),
+                "asunto": h.get("Subject"),
+                "fecha": h.get("Date"),
+                "resumen": full.get("snippet", "")[:160],
+            })
+
+        # (b) Tareas de @default vencidas o que vencen hoy (no completadas)
+        hoy = _dt.date.today().isoformat()
+        pendientes = []
+        tres = tasks.tasks().list(
+            tasklist="@default", maxResults=100, showCompleted=False,
+        ).execute()
+        for t in tres.get("items", []):
+            if t.get("status") == "completed":
+                continue
+            due = t.get("due")
+            if not due:
+                continue
+            if due[:10] <= hoy:
+                pendientes.append({
+                    "id": t.get("id"),
+                    "titulo": t.get("title"),
+                    "estado": t.get("status"),
+                    "vencimiento": due,
+                })
+
+        return {
+            "ok": True,
+            "fecha": hoy,
+            "correos_no_leidos": correos,
+            "tareas_pendientes": pendientes,
+        }
+    except Exception as e:
+        return _err("bandeja_del_dia", e)
+
+
+@mcp.tool()
+def agenda_del_dia(fecha: Optional[str] = None) -> dict:
+    """Agenda del dia: eventos de Google Calendar de la fecha indicada con sus
+    documentos relacionados en Drive.
+
+    Para cada evento devuelve hora, titulo, asistentes y enlace de Google Meet.
+    Ademas busca en Drive archivos cuyo nombre contenga el titulo del evento o
+    el nombre del asistente principal y los adjunta como
+    'documentos_relacionados'.
+
+    Args:
+        fecha: Dia a consultar en formato 'AAAA-MM-DD'. Si no se indica, hoy.
+
+    Devuelve la lista de eventos del dia con sus documentos.
+    """
+    try:
+        import datetime as _dt
+        if not fecha:
+            fecha = _dt.date.today().isoformat()
+        cal = _get_cal()
+        drv = _get_service()
+
+        time_min = fecha + "T00:00:00Z"
+        time_max = fecha + "T23:59:59Z"
+        res = cal.events().list(
+            calendarId="primary", timeMin=time_min, timeMax=time_max,
+            singleEvents=True, orderBy="startTime", maxResults=100,
+        ).execute()
+
+        eventos = []
+        for e in res.get("items", []):
+            st = e.get("start", {})
+            en = e.get("end", {})
+            titulo = e.get("summary") or ""
+            asistentes = [a.get("email") for a in e.get("attendees", [])
+                          if a.get("email")]
+
+            # Terminos de busqueda: titulo y nombre del asistente principal
+            terminos = []
+            if titulo.strip():
+                terminos.append(titulo.strip())
+            if asistentes:
+                principal = asistentes[0].split("@")[0].replace(".", " ").strip()
+                if principal:
+                    terminos.append(principal)
+
+            docs = []
+            if terminos:
+                clausulas = []
+                for term in terminos:
+                    seguro = term.replace("\\", " ").replace("'", " ").strip()
+                    if seguro:
+                        clausulas.append("name contains '%s'" % seguro)
+                if clausulas:
+                    q = "(" + " or ".join(clausulas) + ") and trashed = false"
+                    try:
+                        dres = drv.files().list(
+                            q=q, pageSize=5,
+                            fields="files(%s)" % FILE_FIELDS,
+                            supportsAllDrives=True,
+                            includeItemsFromAllDrives=True,
+                        ).execute()
+                        docs = [_file(f) for f in dres.get("files", [])]
+                    except Exception:
+                        docs = []
+
+            eventos.append({
+                "id": e.get("id"),
+                "titulo": titulo,
+                "hora_inicio": st.get("dateTime") or st.get("date"),
+                "hora_fin": en.get("dateTime") or en.get("date"),
+                "asistentes": asistentes,
+                "meet": e.get("hangoutLink"),
+                "link": e.get("htmlLink"),
+                "documentos_relacionados": docs,
+            })
+
+        return {
+            "ok": True,
+            "fecha": fecha,
+            "count": len(eventos),
+            "eventos": eventos,
+        }
+    except Exception as e:
+        return _err("agenda_del_dia", e)
 
 
 # --------------------------------------------------------------------------- #

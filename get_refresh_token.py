@@ -20,9 +20,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 SCOPES = ["https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/gmail.modify",
           "https://www.googleapis.com/auth/gmail.send",
+          "https://www.googleapis.com/auth/gmail.settings.basic",
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/tasks",
-          "https://www.googleapis.com/auth/contacts.readonly"]
+          "https://www.googleapis.com/auth/contacts"]
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 
