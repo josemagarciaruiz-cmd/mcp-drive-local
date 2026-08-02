@@ -1,6 +1,5 @@
-# Instalador del Agente Drive para Windows (PowerShell).
-# Uso, con Claude CERRADO, dentro de la carpeta del proyecto:
-#   powershell -ExecutionPolicy Bypass -File .\instalar.ps1
+# Instalador del conector MCP Drive COMPLETO para Windows (PowerShell).
+# Ejecutar con Claude CERRADO (el .bat lo cierra por ti).
 $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
@@ -9,31 +8,25 @@ python -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -q --upgrade pip
 & .\.venv\Scripts\pip.exe install -q -r requirements.txt
 
-if (-not (Test-Path ".env")) {
+$hasToken = (Test-Path ".env") -and (Select-String -Path ".env" -Pattern '^GOOGLE_REFRESH_TOKEN=.+' -Quiet)
+if (-not $hasToken) {
     Write-Host ""
-    Write-Host "==> 2/3  Pega tus credenciales de Google (las mismas de casa):"
-    $cid  = Read-Host "   GOOGLE_CLIENT_ID"
-    $csec = Read-Host "   GOOGLE_CLIENT_SECRET"
-    $rtok = Read-Host "   GOOGLE_REFRESH_TOKEN"
-    @(
-        "GOOGLE_CLIENT_ID=$cid",
-        "GOOGLE_CLIENT_SECRET=$csec",
-        "GOOGLE_REFRESH_TOKEN=$rtok",
-        "ALLOWED_DIRS=~",
-        "AGENT_HOST=127.0.0.1",
-        "AGENT_PORT=8765"
-    ) | Set-Content -Encoding UTF8 .env
-    Write-Host "   .env creado (acceso amplio: toda tu carpeta de usuario)."
+    Write-Host "==> 2/3  Generando TU token de Google."
+    Write-Host "         Se abrira el navegador: inicia sesion con TU cuenta y pulsa Permitir."
+    Write-Host "         (Si sale 'app no verificada': Configuracion avanzada -> continuar.)"
+    & .\.venv\Scripts\python.exe get_refresh_token.py
+    if (-not (Select-String -Path ".env" -Pattern '^ALLOWED_DIRS=' -Quiet)) {
+        Add-Content -Path .env -Value "ALLOWED_DIRS=~"
+    }
 } else {
-    Write-Host "==> 2/3  Ya existe .env, lo reutilizo."
+    Write-Host "==> 2/3  Ya hay token en .env, lo reutilizo."
 }
 
 Write-Host ""
-Write-Host "==> 3/3  Cerrando Claude (necesario para registrar el conector) y dando de alta..."
+Write-Host "==> 3/3  Cerrando Claude y registrando los conectores..."
 taskkill /IM Claude.exe /F /T 2>$null | Out-Null
 Start-Sleep -Seconds 3
 & .\.venv\Scripts\python.exe conectar_claude.py
 
 Write-Host ""
-Write-Host "Si te ha avisado de que Claude esta ABIERTO: cierralo del todo y vuelve a ejecutar."
-Write-Host "Cuando termine sin avisos: abre Claude y pide 'lista mis carpetas del Agente Drive'."
+Write-Host "LISTO. Abre Claude. Tendras 'mcp-drive' (completo) y 'agente-drive'."

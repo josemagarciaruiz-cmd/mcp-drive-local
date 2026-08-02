@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Da de alta (o actualiza) el conector 'agente-drive' en la configuracion de
-Claude Desktop, en modo stdio, leyendo las credenciales del .env de esta carpeta.
-Uso:  python3 conectar_claude.py   (o:  ./conectar_claude.sh)
+Registra en Claude Desktop los DOS conectores locales del MCP Drive:
+  - 'mcp-drive'    -> server.py  (conector COMPLETO: 45 comandos sobre tu Drive)
+  - 'agente-drive' -> agent.py   (puente entre el disco fisico y Drive)
+Ambos por stdio, con las credenciales del .env de esta carpeta.
 
-IMPORTANTE: hazlo con Claude COMPLETAMENTE CERRADO (Cmd+Q). Si la app esta abierta
-sobrescribe el cambio al guardar y el conector no aparece. El script lo detecta y
-se niega a actuar (excluyendo 'chrome-native-host' y 'crashpad', que no cuentan).
-No sube nada a internet; solo edita el fichero local de Claude, con copia previa.
+IMPORTANTE: ejecutar con Claude COMPLETAMENTE CERRADO (si esta abierto, al cerrarse
+sobrescribe el cambio). El script lo detecta y se niega si Claude esta abierto.
 """
 import json, os, sys, shutil, time, platform, subprocess
 
@@ -26,8 +25,6 @@ def config_path():
 
 
 def claude_procs():
-    """Procesos de la APP de escritorio Claude que estan vivos. Excluye
-    'chrome-native-host' (lo lanza Chrome, sobrevive al Cmd+Q) y el 'crashpad'."""
     procs = []
     try:
         sysname = platform.system()
@@ -53,8 +50,7 @@ def claude_procs():
 
 def load_env(p):
     if not os.path.exists(p):
-        sys.exit("ERROR: no encuentro el archivo .env en " + p +
-                 "\nCopia .env.example a .env y rellena tus datos antes de ejecutar esto.")
+        sys.exit("ERROR: no encuentro el archivo .env en " + p)
     ev = {}
     for line in open(p, encoding="utf-8"):
         line = line.strip()
@@ -70,29 +66,36 @@ def main():
     if procs and "--force" not in sys.argv:
         muestra = "\n".join("   - " + x for x in procs[:6])
         sys.exit("ATENCION: Claude (app de escritorio) sigue ABIERTO. Cierralo del todo\n"
-                 "con Cmd+Q, espera 3 segundos y repite. Procesos detectados:\n"
-                 + muestra +
-                 "\n(chrome-native-host y crashpad ya se ignoran. Con --force forzarias,\n"
-                 " pero perderias el cambio al cerrar Claude.)")
+                 "con Cmd+Q (o cerrar del todo en Windows), espera 3 segundos y repite.\n"
+                 "Procesos detectados:\n" + muestra)
 
     ev = load_env(ENVP)
     faltan = [k for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN") if not ev.get(k)]
     if faltan:
-        sys.exit("ERROR: faltan credenciales en el .env: " + ", ".join(faltan))
+        sys.exit("ERROR: faltan credenciales en el .env: " + ", ".join(faltan) +
+                 "\nGenera el token primero (get_refresh_token.py).")
 
-    py = os.path.join(HERE, ".venv/bin/python")
     if platform.system() == "Windows":
         py = os.path.join(HERE, ".venv/Scripts/python.exe")
+    else:
+        py = os.path.join(HERE, ".venv/bin/python")
+    server = os.path.join(HERE, "server.py")
     agent = os.path.join(HERE, "agent.py")
-    if not os.path.exists(py):
-        sys.exit("ERROR: no existe el entorno virtual. Ejecuta primero ./install.sh")
-    if not os.path.exists(agent):
-        sys.exit("ERROR: no encuentro agent.py en " + HERE)
+    for f in (py, server, agent):
+        if not os.path.exists(f):
+            sys.exit("ERROR: falta " + f + " (ejecuta antes el instalador).")
 
-    raw = ev.get("ALLOWED_DIRS", "~")
+    raw = ev.get("ALLOWED_DIRS", "~") or "~"
     sep = ";" if platform.system() == "Windows" else ":"
-    partes = [os.path.realpath(os.path.expanduser(os.path.expandvars(x))) for x in raw.split(":") if x]
-    allowed = sep.join(partes)
+    partes = [os.path.realpath(os.path.expanduser(os.path.expandvars(x)))
+              for x in raw.split(":") if x.strip()]
+    allowed = sep.join(partes) if partes else os.path.expanduser("~")
+
+    creds = {
+        "GOOGLE_CLIENT_ID": ev["GOOGLE_CLIENT_ID"],
+        "GOOGLE_CLIENT_SECRET": ev["GOOGLE_CLIENT_SECRET"],
+        "GOOGLE_REFRESH_TOKEN": ev["GOOGLE_REFRESH_TOKEN"],
+    }
 
     cfg = config_path()
     os.makedirs(os.path.dirname(cfg), exist_ok=True)
@@ -101,25 +104,23 @@ def main():
         d = json.load(open(cfg, encoding="utf-8"))
     else:
         d = {}
+    d.setdefault("mcpServers", {})
 
-    d.setdefault("mcpServers", {})["agente-drive"] = {
-        "command": py,
-        "args": [agent],
-        "env": {
-            "MCP_TRANSPORT": "stdio",
-            "GOOGLE_CLIENT_ID": ev["GOOGLE_CLIENT_ID"],
-            "GOOGLE_CLIENT_SECRET": ev["GOOGLE_CLIENT_SECRET"],
-            "GOOGLE_REFRESH_TOKEN": ev["GOOGLE_REFRESH_TOKEN"],
-            "ALLOWED_DIRS": allowed,
-        },
+    d["mcpServers"]["mcp-drive"] = {
+        "command": py, "args": [server],
+        "env": dict(creds, MCP_TRANSPORT="stdio"),
+    }
+    d["mcpServers"]["agente-drive"] = {
+        "command": py, "args": [agent],
+        "env": dict(creds, MCP_TRANSPORT="stdio", ALLOWED_DIRS=allowed),
     }
     json.dump(d, open(cfg, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    print("OK. Conector 'agente-drive' dado de alta.")
-    print("  Config:      " + cfg)
-    print("  Carpetas:    " + allowed)
-    print("  Conectores:  " + ", ".join(d["mcpServers"].keys()))
-    print("\nUltimo paso: abre Claude y, en un chat nuevo, pide 'lista mis carpetas del Agente Drive'.")
+    print("OK. Conectores dados de alta: 'mcp-drive' (completo) y 'agente-drive' (puente).")
+    print("  Config:     " + cfg)
+    print("  Carpetas:   " + allowed)
+    print("  Conectores: " + ", ".join(d["mcpServers"].keys()))
+    print("\nAbre Claude y pide, por ejemplo, 'usa mcp-drive para listar mi unidad'.")
 
 
 if __name__ == "__main__":

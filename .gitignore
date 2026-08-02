@@ -1,9 +1,9 @@
-.env
-*.env
-client_secret*.json
-token.json
 .venv/
-venv/
 __pycache__/
 *.pyc
-.DS_Store
+.env
+client_secret_*.json
+*.log
+audit.jsonl
+server_deploy*.py
+_cred_*.md

@@ -1,42 +1,28 @@
 #!/usr/bin/env bash
-# Instalador unico del Agente Drive (puente disco <-> Drive).
-# Uso, con Claude CERRADO:  ./instalar.sh
-# Hace: entorno + dependencias, crea el .env (pregunta las 3 claves si falta) y
-# da de alta el conector 'agente-drive' en Claude.
+# Instalador del conector MCP Drive COMPLETO (para el Drive de quien lo instala).
+# Ejecutar con Claude CERRADO:  ./instalar.sh
 set -e
 cd "$(dirname "$0")"
 
-echo "==> 1/3  Preparando entorno y dependencias..."
+echo "==> 1/3  Entorno y dependencias..."
 python3 -m venv .venv
 ./.venv/bin/pip install -q --upgrade pip
 ./.venv/bin/pip install -q -r requirements.txt
 
-if [ ! -f .env ]; then
+if [ ! -f .env ] || ! grep -q '^GOOGLE_REFRESH_TOKEN=.\+' .env 2>/dev/null; then
   echo
-  echo "==> 2/3  No hay .env. Pega tus credenciales de Google (las mismas de casa):"
-  read -r -p "   GOOGLE_CLIENT_ID: " CID
-  read -r -p "   GOOGLE_CLIENT_SECRET: " CSEC
-  read -r -p "   GOOGLE_REFRESH_TOKEN: " RTOK
-  cat > .env <<ENV
-GOOGLE_CLIENT_ID=$CID
-GOOGLE_CLIENT_SECRET=$CSEC
-GOOGLE_REFRESH_TOKEN=$RTOK
-ALLOWED_DIRS=\$HOME
-AGENT_HOST=127.0.0.1
-AGENT_PORT=8765
-ENV
-  echo "   .env creado (acceso amplio: toda tu carpeta de usuario)."
+  echo "==> 2/3  Generando TU token de Google."
+  echo "         Se abrira el navegador: inicia sesion con TU cuenta y pulsa Permitir."
+  echo "         (Si sale 'app no verificada': Configuracion avanzada -> continuar.)"
+  ./.venv/bin/python get_refresh_token.py
+  grep -q '^ALLOWED_DIRS=' .env 2>/dev/null || echo 'ALLOWED_DIRS=~' >> .env
 else
-  echo "==> 2/3  Ya existe .env, lo reutilizo."
+  echo "==> 2/3  Ya hay token en .env, lo reutilizo."
 fi
 
 echo
-echo "==> 3/3  Dando de alta el conector en Claude..."
-python3 conectar_claude.py || {
-  echo
-  echo "   (Si te ha avisado de que Claude esta abierto: cierralo con Cmd+Q,"
-  echo "    espera 3 segundos y ejecuta de nuevo:  ./conectar_claude.sh )"
-  exit 0
-}
+echo "==> 3/3  Registrando los conectores en Claude..."
+./.venv/bin/python conectar_claude.py
+
 echo
-echo "LISTO. Abre Claude y pide: 'lista mis carpetas del Agente Drive'."
+echo "LISTO. Abre Claude. Tendras dos conectores: 'mcp-drive' (completo) y 'agente-drive'."

@@ -1,40 +1,26 @@
-# MCP Drive Local — mini-agente (puente disco ↔ Drive)
+# MCP Drive — instalación local (conector completo + puente de disco)
 
-Complemento **local** del conector alojado **MCP Drive**. Corre en `127.0.0.1`
-(no expuesto a la red) y mueve archivos y carpetas entre el ordenador y Google
-Drive **sin base64 y de cualquier tamaño** (subida resumible). Los bytes van
-disco → agente → Drive, sin pasar por el modelo.
+Instala en el ordenador de una persona DOS conectores para Claude, funcionando
+sobre SU propio Google Drive con SUS credenciales:
 
-## Herramientas
+- **mcp-drive**  — conector completo: 45 comandos (mover, renombrar, copiar, crear
+  carpetas, editar Documentos de Google, leer PDF/Word/Excel/PowerPoint, papelera,
+  permisos, remediación de compartidos, auditoría, etc.).
+- **agente-drive** — puente entre el disco físico del equipo y Drive (subir/bajar).
 
-| Herramienta | Qué hace |
-|---|---|
-| `local_allowed_dirs` | Muestra las carpetas permitidas |
-| `local_list` | Lista una carpeta local |
-| `local_upload_to_drive` | Sube un archivo del disco a Drive |
-| `local_upload_folder` | Sube una carpeta entera (con estructura) |
-| `local_download_from_drive` | Baja un archivo de Drive al disco |
-| `local_download_folder` | Baja una carpeta entera al disco |
+## Instalación
 
-## Instalación (un comando)
+Con Claude CERRADO:
 
-```bash
-git clone https://github.com/<tu-cuenta>/mcp-drive-local.git
-cd mcp-drive-local
-cp .env.example .env      # rellena credenciales y ALLOWED_DIRS
-bash install.sh
-```
+- **Mac/Linux:** `./instalar.sh`
+- **Windows:** doble clic en `INSTALAR_WINDOWS.bat`
 
-El instalador crea el entorno, deja el agente como servicio (launchd en macOS,
-systemd en Linux) y lo arranca. Luego, en Claude:
-**Ajustes → Conectores → Añadir conector personalizado → `http://127.0.0.1:8765/mcp`**
+El instalador prepara el entorno, genera el token de Google de la persona (se abre
+el navegador para que pulse "Permitir") y registra los dos conectores. Necesita el
+`client_secret_*.json` (tipo *Aplicación de escritorio*) en esta carpeta o en
+Descargas.
 
-## Seguridad
+Requisitos: Python 3 y Git instalados.
 
-- Solo accede a las carpetas de `ALLOWED_DIRS`. Nada fuera de ahí.
-- Escucha solo en `127.0.0.1`: no accesible desde la red.
-- Las credenciales viven en `.env` local (nunca en GitHub).
-
-## Licencia
-
-Uso del titular. Sin garantía.
+Los secretos (`.env`, `client_secret_*.json`) nunca se suben a git.
+El protocolo de instalación paso a paso está en el Drive del proyecto.
