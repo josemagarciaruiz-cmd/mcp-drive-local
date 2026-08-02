@@ -35,8 +35,11 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 # --------------------------------------------------------------------------- #
 
 SCOPES = ["https://www.googleapis.com/auth/drive",
-          "https://www.googleapis.com/auth/gmail.readonly",
-          "https://www.googleapis.com/auth/calendar"]
+          "https://www.googleapis.com/auth/gmail.modify",
+          "https://www.googleapis.com/auth/gmail.send",
+          "https://www.googleapis.com/auth/calendar",
+          "https://www.googleapis.com/auth/tasks",
+          "https://www.googleapis.com/auth/contacts.readonly"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 # Campos estándar que devolvemos de cada archivo/carpeta
@@ -1313,6 +1316,1242 @@ def calendar_disponibilidad(time_min: str, time_max: str, calendar_id: str = "pr
         return {"ok": True, "ocupado": busy}
     except Exception as e:
         return _err("calendar_disponibilidad", e)
+
+
+# ==========================================================================
+# BLOQUE: Gmail de ESCRITURA (enviar, responder, borradores, etiquetas)
+# ==========================================================================
+
+
+@mcp.tool()
+def gmail_enviar(para: str, asunto: str, cuerpo: str, cc: Optional[str] = None, adjuntos_drive: Optional[list] = None):
+    """Envia un correo desde Gmail. Compone un mensaje MIME con destinatario, asunto y cuerpo de texto plano; admite copia (cc). Si se indican fileIds de Google Drive en adjuntos_drive, descarga cada archivo y lo adjunta al correo. Devuelve el id del mensaje enviado."""
+    try:
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.base import MIMEBase
+        from email import encoders
+        svc = _get_gmail()
+        msg = MIMEMultipart()
+        msg['To'] = para
+        msg['Subject'] = asunto
+        if cc:
+            msg['Cc'] = cc
+        msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
+        if adjuntos_drive:
+            drive = _get_service()
+            for fid in adjuntos_drive:
+                meta = drive.files().get(fileId=fid, fields='id, name, mimeType').execute()
+                nombre = meta.get('name', str(fid))
+                buf = io.BytesIO()
+                downloader = MediaIoBaseDownload(buf, drive.files().get_media(fileId=fid))
+                done = False
+                while not done:
+                    _progreso, done = downloader.next_chunk()
+                buf.seek(0)
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(buf.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', 'attachment', filename=nombre)
+                msg.attach(part)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        enviado = svc.users().messages().send(userId='me', body={'raw': raw}).execute()
+        _audit("gmail_enviar", {"para": para, "asunto": asunto, "cc": cc, "adjuntos": adjuntos_drive, "id": enviado.get('id')})
+        return {"ok": True, "id": enviado.get('id'), "threadId": enviado.get('threadId')}
+    except Exception as e:
+        return _err("gmail_enviar", e)
+
+
+@mcp.tool()
+def gmail_responder(message_id: str, texto: str):
+    """Responde a un correo existente dentro de su MISMO hilo. Obtiene el mensaje original para extraer el remitente, el asunto y las cabeceras de referencia; compone la respuesta con destinatario el remitente original, asunto con prefijo 'Re:' y cabeceras In-Reply-To y References; y la envia en el mismo threadId. Devuelve el id del mensaje enviado."""
+    try:
+        from email.mime.text import MIMEText
+        svc = _get_gmail()
+        original = svc.users().messages().get(
+            userId='me', id=message_id, format='metadata',
+            metadataHeaders=['From', 'Subject', 'Message-Id', 'References']).execute()
+        thread_id = original.get('threadId')
+        headers = original.get('payload', {}).get('headers', [])
+
+        def _h(name):
+            for h in headers:
+                if h.get('name', '').lower() == name.lower():
+                    return h.get('value')
+            return None
+
+        remitente = _h('From') or ''
+        asunto_orig = _h('Subject') or ''
+        msg_id_hdr = _h('Message-Id')
+        refs = _h('References')
+        asunto = asunto_orig if asunto_orig.lower().startswith('re:') else 'Re: ' + asunto_orig
+        msg = MIMEText(texto, 'plain', 'utf-8')
+        msg['To'] = remitente
+        msg['Subject'] = asunto
+        if msg_id_hdr:
+            msg['In-Reply-To'] = msg_id_hdr
+            msg['References'] = (refs + ' ' + msg_id_hdr) if refs else msg_id_hdr
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        enviado = svc.users().messages().send(userId='me', body={'raw': raw, 'threadId': thread_id}).execute()
+        _audit("gmail_responder", {"message_id": message_id, "para": remitente, "asunto": asunto, "id": enviado.get('id')})
+        return {"ok": True, "id": enviado.get('id'), "threadId": enviado.get('threadId')}
+    except Exception as e:
+        return _err("gmail_responder", e)
+
+
+@mcp.tool()
+def gmail_crear_borrador(para: str, asunto: str, cuerpo: str):
+    """Crea un borrador de correo en Gmail SIN enviarlo. Compone un mensaje MIME con destinatario, asunto y cuerpo de texto plano y lo guarda como borrador. Devuelve el id del borrador creado."""
+    try:
+        from email.mime.text import MIMEText
+        svc = _get_gmail()
+        msg = MIMEText(cuerpo, 'plain', 'utf-8')
+        msg['To'] = para
+        msg['Subject'] = asunto
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        borrador = svc.users().drafts().create(userId='me', body={'message': {'raw': raw}}).execute()
+        _audit("gmail_crear_borrador", {"para": para, "asunto": asunto, "id": borrador.get('id')})
+        return {"ok": True, "id": borrador.get('id')}
+    except Exception as e:
+        return _err("gmail_crear_borrador", e)
+
+
+@mcp.tool()
+def gmail_etiquetar(message_id: str, add_labels: Optional[list] = None, remove_labels: Optional[list] = None):
+    """Modifica las etiquetas de un mensaje de Gmail. Anade las etiquetas indicadas en add_labels y elimina las de remove_labels (identificadas por sus labelIds). Devuelve el mensaje con sus etiquetas actualizadas."""
+    try:
+        svc = _get_gmail()
+        body = {}
+        if add_labels:
+            body['addLabelIds'] = add_labels
+        if remove_labels:
+            body['removeLabelIds'] = remove_labels
+        res = svc.users().messages().modify(userId='me', id=message_id, body=body).execute()
+        _audit("gmail_etiquetar", {"message_id": message_id, "add": add_labels, "remove": remove_labels})
+        return {"ok": True, "id": res.get('id'), "labelIds": res.get('labelIds')}
+    except Exception as e:
+        return _err("gmail_etiquetar", e)
+
+
+# =====================================================================
+# BLOQUE: Calendar (Google Calendar v3)
+# Se APPENDEA a server.py. No añade imports ni redefine nada.
+# Usa helpers ya existentes: _get_cal(), _err(), _audit().
+# =====================================================================
+
+
+@mcp.tool()
+def calendar_actualizar_evento(
+    event_id: str,
+    summary: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    description: Optional[str] = None,
+    calendar_id: str = "primary",
+):
+    """Actualiza (patch) un evento del calendario con los campos no nulos.
+
+    start/end se envían como {'dateTime': valor} en formato RFC3339.
+    Notifica a todos los asistentes (sendUpdates='all'). Devuelve id,
+    summary y enlace del evento actualizado.
+    """
+    try:
+        cal = _get_cal()
+        body = {}
+        if summary is not None:
+            body["summary"] = summary
+        if description is not None:
+            body["description"] = description
+        if start is not None:
+            body["start"] = {"dateTime": start}
+        if end is not None:
+            body["end"] = {"dateTime": end}
+        ev = (
+            cal.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body=body,
+                sendUpdates="all",
+            )
+            .execute()
+        )
+        _audit(
+            "calendar_actualizar_evento",
+            f"calendar={calendar_id} event={event_id} campos={list(body.keys())}",
+        )
+        return {
+            "id": ev.get("id"),
+            "summary": ev.get("summary"),
+            "link": ev.get("htmlLink"),
+        }
+    except Exception as e:
+        return _err("calendar_actualizar_evento", e)
+
+
+@mcp.tool()
+def calendar_cancelar_evento(event_id: str, calendar_id: str = "primary"):
+    """Cancela (borra) un evento avisando a los asistentes.
+
+    Ejecuta events().delete con sendUpdates='all' para notificar la
+    cancelación. Devuelve un indicador de resultado.
+    """
+    try:
+        cal = _get_cal()
+        cal.events().delete(
+            calendarId=calendar_id,
+            eventId=event_id,
+            sendUpdates="all",
+        ).execute()
+        _audit(
+            "calendar_cancelar_evento",
+            f"calendar={calendar_id} event={event_id}",
+        )
+        return {"ok": True, "event_id": event_id}
+    except Exception as e:
+        return _err("calendar_cancelar_evento", e)
+
+
+@mcp.tool()
+def calendar_responder_invitacion(
+    event_id: str,
+    respuesta: str,
+    calendar_id: str = "primary",
+):
+    """Responde a una invitación fijando el responseStatus del asistente.
+
+    'respuesta' debe ser 'accepted', 'declined' o 'tentative'. Localiza en
+    los asistentes el que tenga self=True (o el email del propio calendario
+    vía getProfile) y hace patch de su responseStatus. Devuelve ok.
+    """
+    try:
+        if respuesta not in ("accepted", "declined", "tentative"):
+            raise ValueError(
+                "respuesta debe ser 'accepted', 'declined' o 'tentative'"
+            )
+        cal = _get_cal()
+        ev = cal.events().get(
+            calendarId=calendar_id, eventId=event_id
+        ).execute()
+        attendees = ev.get("attendees", []) or []
+        # Determinar el email propio.
+        self_email = None
+        for a in attendees:
+            if a.get("self"):
+                self_email = a.get("email")
+                break
+        if self_email is None:
+            try:
+                prof = cal.calendarList().get(
+                    calendarId=calendar_id
+                ).execute()
+                self_email = prof.get("id")
+            except Exception:
+                self_email = calendar_id if calendar_id != "primary" else None
+        encontrado = False
+        for a in attendees:
+            if a.get("self") or (
+                self_email is not None and a.get("email") == self_email
+            ):
+                a["responseStatus"] = respuesta
+                encontrado = True
+                break
+        if not encontrado:
+            if self_email is None:
+                raise ValueError(
+                    "No se pudo identificar al asistente propio en el evento"
+                )
+            attendees.append(
+                {"email": self_email, "responseStatus": respuesta}
+            )
+        ev2 = (
+            cal.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body={"attendees": attendees},
+                sendUpdates="all",
+            )
+            .execute()
+        )
+        _audit(
+            "calendar_responder_invitacion",
+            f"calendar={calendar_id} event={event_id} respuesta={respuesta}",
+        )
+        return {"ok": True, "event_id": ev2.get("id"), "respuesta": respuesta}
+    except Exception as e:
+        return _err("calendar_responder_invitacion", e)
+
+
+@mcp.tool()
+def calendar_anadir_asistentes(
+    event_id: str,
+    emails: list,
+    calendar_id: str = "primary",
+):
+    """Añade asistentes nuevos a un evento y notifica el cambio.
+
+    Obtiene el evento, agrega a la lista de asistentes los emails que aún no
+    figuren, y hace patch con sendUpdates='all'. Devuelve la lista final de
+    asistentes.
+    """
+    try:
+        cal = _get_cal()
+        ev = cal.events().get(
+            calendarId=calendar_id, eventId=event_id
+        ).execute()
+        attendees = ev.get("attendees", []) or []
+        existentes = {
+            (a.get("email") or "").lower() for a in attendees
+        }
+        nuevos = []
+        for em in emails:
+            if em and em.lower() not in existentes:
+                attendees.append({"email": em})
+                existentes.add(em.lower())
+                nuevos.append(em)
+        ev2 = (
+            cal.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body={"attendees": attendees},
+                sendUpdates="all",
+            )
+            .execute()
+        )
+        _audit(
+            "calendar_anadir_asistentes",
+            f"calendar={calendar_id} event={event_id} nuevos={nuevos}",
+        )
+        return ev2.get("attendees", []) or []
+    except Exception as e:
+        return _err("calendar_anadir_asistentes", e)
+
+
+
+# =========================================================
+# BLOQUE: Slides + Tasks + Contactos (Google Workspace)
+# Se APPENDEA a server.py (FastMCP). No redefine nada existente.
+# =========================================================
+
+
+def _get_slides():
+    """Devuelve (y cachea) el servicio de Google Slides v1."""
+    if not hasattr(_get_slides, "_svc"):
+        _get_slides._svc = build(
+            "slides", "v1", credentials=_build_creds(), cache_discovery=False
+        )
+    return _get_slides._svc
+
+
+def _get_tasks():
+    """Devuelve (y cachea) el servicio de Google Tasks v1."""
+    if not hasattr(_get_tasks, "_svc"):
+        _get_tasks._svc = build(
+            "tasks", "v1", credentials=_build_creds(), cache_discovery=False
+        )
+    return _get_tasks._svc
+
+
+def _get_people():
+    """Devuelve (y cachea) el servicio de Google People v1."""
+    if not hasattr(_get_people, "_svc"):
+        _get_people._svc = build(
+            "people", "v1", credentials=_build_creds(), cache_discovery=False
+        )
+    return _get_people._svc
+
+
+# ------------------------- SLIDES -------------------------
+
+@mcp.tool()
+def slides_crear(titulo: str, diapositivas: Optional[list] = None) -> dict:
+    """Crea una presentación de Google Slides.
+
+    Args:
+        titulo: Título de la presentación.
+        diapositivas: Lista opcional de dicts {'titulo':.., 'cuerpo':..};
+            por cada elemento se añade una diapositiva con layout
+            TITLE_AND_BODY rellenando ambos placeholders.
+
+    Devuelve el presentationId y la url de edición.
+    """
+    try:
+        svc = _get_slides()
+        pres = svc.presentations().create(body={"title": titulo}).execute()
+        pid = pres.get("presentationId")
+        if diapositivas:
+            requests = []
+            for idx, dia in enumerate(diapositivas):
+                slide_id = "slide_%d" % idx
+                title_id = "title_%d" % idx
+                body_id = "body_%d" % idx
+                requests.append({
+                    "createSlide": {
+                        "objectId": slide_id,
+                        "slideLayoutReference": {
+                            "predefinedLayout": "TITLE_AND_BODY"
+                        },
+                        "placeholderIdMappings": [
+                            {
+                                "layoutPlaceholder": {"type": "TITLE", "index": 0},
+                                "objectId": title_id,
+                            },
+                            {
+                                "layoutPlaceholder": {"type": "BODY", "index": 0},
+                                "objectId": body_id,
+                            },
+                        ],
+                    }
+                })
+                if dia.get("titulo"):
+                    requests.append({
+                        "insertText": {
+                            "objectId": title_id,
+                            "text": str(dia.get("titulo")),
+                        }
+                    })
+                if dia.get("cuerpo"):
+                    requests.append({
+                        "insertText": {
+                            "objectId": body_id,
+                            "text": str(dia.get("cuerpo")),
+                        }
+                    })
+            if requests:
+                svc.presentations().batchUpdate(
+                    presentationId=pid, body={"requests": requests}
+                ).execute()
+        url = "https://docs.google.com/presentation/d/%s/edit" % pid
+        _audit("slides_crear", "%s - %s" % (pid, titulo))
+        return {"presentationId": pid, "url": url}
+    except Exception as e:
+        return _err("slides_crear", e)
+
+
+@mcp.tool()
+def slides_leer(presentation_id: str, max_chars: int = 20000) -> dict:
+    """Extrae el texto de una presentación de Google Slides.
+
+    Recorre todas las diapositivas y sus elementos de forma (shapes),
+    concatenando el contenido de shape.text.textElements[].textRun.content.
+
+    Args:
+        presentation_id: ID de la presentación.
+        max_chars: Máximo de caracteres a devolver.
+
+    Devuelve el texto extraído.
+    """
+    try:
+        svc = _get_slides()
+        pres = svc.presentations().get(presentationId=presentation_id).execute()
+        partes = []
+        for slide in pres.get("slides", []):
+            for elem in slide.get("pageElements", []):
+                shape = elem.get("shape")
+                if not shape:
+                    continue
+                text = shape.get("text")
+                if not text:
+                    continue
+                for te in text.get("textElements", []):
+                    tr = te.get("textRun")
+                    if tr and tr.get("content"):
+                        partes.append(tr["content"])
+        texto = "".join(partes)[:max_chars]
+        return {"presentationId": presentation_id, "texto": texto}
+    except Exception as e:
+        return _err("slides_leer", e)
+
+
+@mcp.tool()
+def slides_anadir_diapositiva(
+    presentation_id: str, titulo: str, cuerpo: str = ""
+) -> dict:
+    """Añade una diapositiva (layout TITLE_AND_BODY) a una presentación.
+
+    Args:
+        presentation_id: ID de la presentación.
+        titulo: Texto para el placeholder de título.
+        cuerpo: Texto opcional para el placeholder de cuerpo.
+
+    Devuelve ok.
+    """
+    try:
+        svc = _get_slides()
+        suf = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+        slide_id = "slide_" + suf
+        title_id = "title_" + suf
+        body_id = "body_" + suf
+        requests = [
+            {
+                "createSlide": {
+                    "objectId": slide_id,
+                    "slideLayoutReference": {
+                        "predefinedLayout": "TITLE_AND_BODY"
+                    },
+                    "placeholderIdMappings": [
+                        {
+                            "layoutPlaceholder": {"type": "TITLE", "index": 0},
+                            "objectId": title_id,
+                        },
+                        {
+                            "layoutPlaceholder": {"type": "BODY", "index": 0},
+                            "objectId": body_id,
+                        },
+                    ],
+                }
+            },
+            {"insertText": {"objectId": title_id, "text": titulo}},
+        ]
+        if cuerpo:
+            requests.append(
+                {"insertText": {"objectId": body_id, "text": cuerpo}}
+            )
+        svc.presentations().batchUpdate(
+            presentationId=presentation_id, body={"requests": requests}
+        ).execute()
+        _audit("slides_anadir_diapositiva", "%s - %s" % (presentation_id, titulo))
+        return {"ok": True}
+    except Exception as e:
+        return _err("slides_anadir_diapositiva", e)
+
+
+# ------------------------- TASKS --------------------------
+
+@mcp.tool()
+def tasks_listar(max_results: int = 50) -> dict:
+    """Lista las tareas de la lista por defecto (@default).
+
+    Args:
+        max_results: Número máximo de tareas a devolver.
+
+    Devuelve id, título, estado y vencimiento de cada tarea.
+    """
+    try:
+        svc = _get_tasks()
+        res = svc.tasks().list(
+            tasklist="@default", maxResults=max_results
+        ).execute()
+        items = []
+        for t in res.get("items", []):
+            items.append({
+                "id": t.get("id"),
+                "titulo": t.get("title"),
+                "estado": t.get("status"),
+                "vencimiento": t.get("due"),
+            })
+        return {"tareas": items}
+    except Exception as e:
+        return _err("tasks_listar", e)
+
+
+@mcp.tool()
+def tasks_crear(titulo: str, fecha: Optional[str] = None, notas: str = "") -> dict:
+    """Crea una tarea en la lista por defecto (@default).
+
+    Args:
+        titulo: Título de la tarea.
+        fecha: Vencimiento en RFC3339; si llega solo 'AAAA-MM-DD' se
+            convierte a 'AAAA-MM-DDT00:00:00.000Z'.
+        notas: Notas opcionales.
+
+    Devuelve el id de la tarea creada.
+    """
+    try:
+        svc = _get_tasks()
+        due = fecha
+        if fecha and len(fecha) == 10 and "T" not in fecha:
+            due = fecha + "T00:00:00.000Z"
+        body = {"title": titulo, "notes": notas}
+        if due:
+            body["due"] = due
+        t = svc.tasks().insert(tasklist="@default", body=body).execute()
+        _audit("tasks_crear", "%s - %s" % (t.get("id"), titulo))
+        return {"id": t.get("id")}
+    except Exception as e:
+        return _err("tasks_crear", e)
+
+
+@mcp.tool()
+def tasks_completar(task_id: str) -> dict:
+    """Marca una tarea como completada (status='completed').
+
+    Args:
+        task_id: ID de la tarea.
+
+    Devuelve ok.
+    """
+    try:
+        svc = _get_tasks()
+        svc.tasks().patch(
+            tasklist="@default", task=task_id, body={"status": "completed"}
+        ).execute()
+        _audit("tasks_completar", task_id)
+        return {"ok": True}
+    except Exception as e:
+        return _err("tasks_completar", e)
+
+
+# ----------------------- CONTACTOS ------------------------
+
+def _people_a_dict(p: dict) -> dict:
+    """Normaliza una persona de People API a nombre/emails/teléfonos."""
+    nombre = ""
+    if p.get("names"):
+        nombre = p["names"][0].get("displayName", "")
+    emails = [e.get("value") for e in p.get("emailAddresses", []) if e.get("value")]
+    telefonos = [t.get("value") for t in p.get("phoneNumbers", []) if t.get("value")]
+    return {"nombre": nombre, "emails": emails, "telefonos": telefonos}
+
+
+@mcp.tool()
+def contactos_buscar(texto: str, max_results: int = 10) -> dict:
+    """Busca contactos por texto (People API searchContacts).
+
+    Args:
+        texto: Consulta de búsqueda.
+        max_results: Número máximo de resultados.
+
+    Devuelve nombre, emails y teléfonos de cada contacto.
+    """
+    try:
+        svc = _get_people()
+        res = svc.people().searchContacts(
+            query=texto,
+            readMask="names,emailAddresses,phoneNumbers",
+            pageSize=max_results,
+        ).execute()
+        contactos = [_people_a_dict(r.get("person", {})) for r in res.get("results", [])]
+        return {"contactos": contactos}
+    except Exception as e:
+        return _err("contactos_buscar", e)
+
+
+@mcp.tool()
+def contactos_listar(max_results: int = 50) -> dict:
+    """Lista los contactos del usuario (People API connections.list).
+
+    Args:
+        max_results: Número máximo de contactos.
+
+    Devuelve la lista con nombre, emails y teléfonos.
+    """
+    try:
+        svc = _get_people()
+        res = svc.people().connections().list(
+            resourceName="people/me",
+            personFields="names,emailAddresses,phoneNumbers",
+            pageSize=max_results,
+        ).execute()
+        contactos = [_people_a_dict(p) for p in res.get("connections", [])]
+        return {"contactos": contactos}
+    except Exception as e:
+        return _err("contactos_listar", e)
+
+
+
+
+# ============================================================
+# BLOQUE: Unidades compartidas + PDF legal
+# ============================================================
+
+
+@mcp.tool()
+def drive_unidades_compartidas() -> dict:
+    """Lista las unidades compartidas (shared drives) accesibles.
+
+    Devuelve el id y el nombre de cada unidad compartida.
+    """
+    try:
+        service = _get_service()
+        resp = service.drives().list(
+            pageSize=100,
+            fields="drives(id,name)",
+        ).execute()
+        unidades = [
+            {"id": d.get("id"), "nombre": d.get("name")}
+            for d in resp.get("drives", [])
+        ]
+        return {"ok": True, "total": len(unidades), "unidades": unidades}
+    except Exception as e:
+        return _err("drive_unidades_compartidas", e)
+
+
+def _pdf_descargar_bytes(file_id: str) -> "io.BytesIO":
+    """Descarga un archivo de Drive a un io.BytesIO (uso interno)."""
+    service = _get_service()
+    buffer = io.BytesIO()
+    request = service.files().get_media(fileId=file_id)
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buffer.seek(0)
+    return buffer
+
+
+def _pdf_subir_bytes(buffer: "io.BytesIO", nombre_salida: str, parent_id: str) -> str:
+    """Sube un io.BytesIO como PDF a Drive y devuelve el id (uso interno)."""
+    service = _get_service()
+    buffer.seek(0)
+    metadata = {"name": nombre_salida}
+    if parent_id:
+        metadata["parents"] = [parent_id]
+    media = MediaIoBaseUpload(buffer, mimetype="application/pdf", resumable=True)
+    creado = service.files().create(
+        body=metadata,
+        media_body=media,
+        fields=FILE_FIELDS,
+        supportsAllDrives=True,
+    ).execute()
+    return creado.get("id")
+
+
+@mcp.tool()
+def drive_pdf_unir(file_ids: list, nombre_salida: str, parent_id: str = "root") -> dict:
+    """Une varios PDF de Drive en uno solo y lo sube.
+
+    Descarga cada PDF indicado en 'file_ids', los concatena con pypdf
+    en el orden dado y sube el PDF resultante a 'parent_id'.
+    Devuelve el id del PDF creado.
+    """
+    try:
+        from pypdf import PdfWriter
+
+        if not file_ids:
+            return _err("drive_pdf_unir", ValueError("file_ids vacio"))
+
+        writer = PdfWriter()
+        for fid in file_ids:
+            origen = _pdf_descargar_bytes(fid)
+            writer.append(origen)
+
+        salida = io.BytesIO()
+        writer.write(salida)
+        writer.close()
+
+        nuevo_id = _pdf_subir_bytes(salida, nombre_salida, parent_id)
+        _audit(
+            "drive_pdf_unir",
+            f"unidos {len(file_ids)} PDF en '{nombre_salida}' (id={nuevo_id})",
+        )
+        return {"ok": True, "id": nuevo_id, "nombre": nombre_salida}
+    except Exception as e:
+        return _err("drive_pdf_unir", e)
+
+
+@mcp.tool()
+def drive_pdf_marca_agua(
+    file_id: str,
+    texto: str,
+    nombre_salida: str,
+    parent_id: str = "root",
+) -> dict:
+    """Aplica una marca de agua de texto en diagonal a un PDF y lo sube.
+
+    Genera con reportlab una pagina con 'texto' en diagonal, en gris
+    translucido y centrado, y la superpone sobre CADA pagina del PDF
+    original. Sube el resultado a 'parent_id'. Devuelve el id creado.
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.colors import Color
+
+        origen = _pdf_descargar_bytes(file_id)
+        lector = PdfReader(origen)
+        escritor = PdfWriter()
+
+        for pagina in lector.pages:
+            ancho = float(pagina.mediabox.width)
+            alto = float(pagina.mediabox.height)
+
+            overlay_buf = io.BytesIO()
+            c = canvas.Canvas(overlay_buf, pagesize=(ancho, alto))
+            c.saveState()
+            c.setFont("Helvetica-Bold", 60)
+            c.setFillColor(Color(0.5, 0.5, 0.5, alpha=0.3))
+            c.translate(ancho / 2.0, alto / 2.0)
+            c.rotate(45)
+            c.drawCentredString(0, 0, texto)
+            c.restoreState()
+            c.save()
+            overlay_buf.seek(0)
+
+            overlay_pagina = PdfReader(overlay_buf).pages[0]
+            pagina.merge_page(overlay_pagina)
+            escritor.add_page(pagina)
+
+        salida = io.BytesIO()
+        escritor.write(salida)
+        escritor.close()
+
+        nuevo_id = _pdf_subir_bytes(salida, nombre_salida, parent_id)
+        _audit(
+            "drive_pdf_marca_agua",
+            f"marca de agua '{texto}' sobre {file_id} -> '{nombre_salida}' (id={nuevo_id})",
+        )
+        return {"ok": True, "id": nuevo_id, "nombre": nombre_salida}
+    except Exception as e:
+        return _err("drive_pdf_marca_agua", e)
+
+
+@mcp.tool()
+def drive_pdf_foliar(
+    file_id: str,
+    nombre_salida: str,
+    parent_id: str = "root",
+    prefijo: str = "",
+) -> dict:
+    """Anade foliado tipo Bates (numeracion de paginas) a un PDF y lo sube.
+
+    Superpone en cada pagina, abajo a la derecha, un sello con el formato
+    f"{prefijo}{n:04d}" mediante un overlay de reportlab del tamano de la
+    pagina. Sube el resultado a 'parent_id'. Devuelve el id creado.
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+
+        origen = _pdf_descargar_bytes(file_id)
+        lector = PdfReader(origen)
+        escritor = PdfWriter()
+
+        for indice, pagina in enumerate(lector.pages, start=1):
+            ancho = float(pagina.mediabox.width)
+            alto = float(pagina.mediabox.height)
+            sello = f"{prefijo}{indice:04d}"
+
+            overlay_buf = io.BytesIO()
+            c = canvas.Canvas(overlay_buf, pagesize=(ancho, alto))
+            c.setFont("Helvetica", 9)
+            c.setFillColorRGB(0, 0, 0)
+            c.drawRightString(ancho - 36, 24, sello)
+            c.save()
+            overlay_buf.seek(0)
+
+            overlay_pagina = PdfReader(overlay_buf).pages[0]
+            pagina.merge_page(overlay_pagina)
+            escritor.add_page(pagina)
+
+        salida = io.BytesIO()
+        escritor.write(salida)
+        escritor.close()
+
+        nuevo_id = _pdf_subir_bytes(salida, nombre_salida, parent_id)
+        _audit(
+            "drive_pdf_foliar",
+            f"foliado '{prefijo}' sobre {file_id} -> '{nombre_salida}' (id={nuevo_id})",
+        )
+        return {"ok": True, "id": nuevo_id, "nombre": nombre_salida}
+    except Exception as e:
+        return _err("drive_pdf_foliar", e)
+
+
+# ============================================================================
+# BLOQUE: Cálculo de PLAZOS PROCESALES (jurisdicción española)
+# ----------------------------------------------------------------------------
+# Python puro con datetime. Se APPENDEA a server.py (FastMCP).
+# Requiere ya definidos: mcp, Optional (typing) y el helper _err(action, e).
+# NOTA: los festivos AUTONÓMICOS y LOCALES no se incluyen aquí; pueden
+#       pasarse mediante el parámetro 'festivos_extra' (lista de 'AAAA-MM-DD').
+# ADVERTENCIA: herramienta de ayuda; no sustituye la verificación por un
+#              profesional del cómputo aplicable a cada procedimiento.
+# ============================================================================
+
+# Festivos NACIONALES de España para 2025 y 2026 (fechas fijas + Viernes Santo).
+FESTIVOS_NACIONALES_ES = [
+    # 2025
+    "2025-01-01",  # Año Nuevo
+    "2025-01-06",  # Epifanía / Reyes
+    "2025-04-18",  # Viernes Santo
+    "2025-05-01",  # Fiesta del Trabajo
+    "2025-08-15",  # Asunción de la Virgen
+    "2025-10-12",  # Fiesta Nacional de España
+    "2025-11-01",  # Todos los Santos
+    "2025-12-06",  # Día de la Constitución
+    "2025-12-08",  # Inmaculada Concepción
+    "2025-12-25",  # Natividad del Señor
+    # 2026
+    "2026-01-01",  # Año Nuevo
+    "2026-01-06",  # Epifanía / Reyes
+    "2026-04-03",  # Viernes Santo
+    "2026-05-01",  # Fiesta del Trabajo
+    "2026-08-15",  # Asunción de la Virgen
+    "2026-10-12",  # Fiesta Nacional de España
+    "2026-11-01",  # Todos los Santos
+    "2026-12-06",  # Día de la Constitución
+    "2026-12-08",  # Inmaculada Concepción
+    "2026-12-25",  # Natividad del Señor
+]
+
+# Nombres de los días de la semana en español (0 = lunes ... 6 = domingo).
+_DIAS_SEMANA_ES = [
+    "lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo",
+]
+
+
+def _es_dia_inhabil(d, sabado_inhabil, agosto_inhabil, festivos):
+    """Devuelve True si la fecha 'd' (datetime.date) es día inhábil."""
+    wd = d.weekday()  # lunes=0 ... domingo=6
+    if wd == 6:  # el domingo es SIEMPRE inhábil
+        return True
+    if sabado_inhabil and wd == 5:  # sábado inhábil si procede
+        return True
+    if agosto_inhabil and d.month == 8:  # todo agosto (plazos procesales)
+        return True
+    if d.isoformat() in festivos:  # festivos nacionales + extra
+        return True
+    return False
+
+
+def _construir_festivos(festivos_extra):
+    """Combina los festivos nacionales con los extra recibidos (o None)."""
+    festivos = set(FESTIVOS_NACIONALES_ES)
+    if festivos_extra:
+        festivos.update(str(f) for f in festivos_extra)
+    return festivos
+
+
+@mcp.tool()
+def plazo_dias_habiles(
+    fecha_inicio: str,
+    dias: int,
+    sabado_inhabil: bool = True,
+    agosto_inhabil: bool = False,
+    festivos_extra: Optional[list] = None,
+):
+    """Suma días HÁBILES a una fecha para obtener el vencimiento del plazo.
+
+    Partiendo de 'fecha_inicio' (AAAA-MM-DD) suma 'dias' días hábiles: salta
+    siempre los domingos; los sábados si 'sabado_inhabil'; los festivos
+    nacionales más 'festivos_extra'; y todo el mes de agosto si
+    'agosto_inhabil' (propio de plazos procesales). Devuelve la fecha de
+    vencimiento (AAAA-MM-DD), el día de la semana y los días naturales
+    transcurridos.
+    """
+    try:
+        import datetime
+        festivos = _construir_festivos(festivos_extra)
+        inicio = datetime.date.fromisoformat(fecha_inicio)
+        actual = inicio
+        contados = 0
+        while contados < dias:
+            actual = actual + datetime.timedelta(days=1)
+            if not _es_dia_inhabil(actual, sabado_inhabil, agosto_inhabil, festivos):
+                contados += 1
+        return {
+            "fecha_inicio": inicio.isoformat(),
+            "dias_habiles_sumados": dias,
+            "fecha_vencimiento": actual.isoformat(),
+            "dia_semana": _DIAS_SEMANA_ES[actual.weekday()],
+            "dias_naturales_transcurridos": (actual - inicio).days,
+            "sabado_inhabil": sabado_inhabil,
+            "agosto_inhabil": agosto_inhabil,
+        }
+    except Exception as e:
+        return _err("plazo_dias_habiles", e)
+
+
+@mcp.tool()
+def plazo_vencimiento_notificacion(
+    fecha_notificacion: str,
+    dias_habiles: int,
+    agosto_inhabil: bool = False,
+    festivos_extra: Optional[list] = None,
+):
+    """Calcula el vencimiento de un plazo desde la notificación.
+
+    Atajo que aplica la regla habitual: el cómputo empieza el día siguiente
+    al de la notificación (AAAA-MM-DD). Los sábados se consideran inhábiles.
+    Devuelve la fecha de vencimiento, el día de la semana y una nota
+    recordando que es una ayuda y no sustituye la verificación del
+    profesional para cada procedimiento concreto.
+    """
+    try:
+        import datetime
+        festivos = _construir_festivos(festivos_extra)
+        inicio = datetime.date.fromisoformat(fecha_notificacion)
+        actual = inicio
+        contados = 0
+        while contados < dias_habiles:
+            actual = actual + datetime.timedelta(days=1)
+            if not _es_dia_inhabil(actual, True, agosto_inhabil, festivos):
+                contados += 1
+        return {
+            "fecha_notificacion": inicio.isoformat(),
+            "dias_habiles": dias_habiles,
+            "fecha_vencimiento": actual.isoformat(),
+            "dia_semana": _DIAS_SEMANA_ES[actual.weekday()],
+            "nota": (
+                "El cómputo se inicia el día siguiente al de la notificación. "
+                "Herramienta de ayuda: no sustituye la verificación del cómputo "
+                "por el profesional según el procedimiento aplicable."
+            ),
+        }
+    except Exception as e:
+        return _err("plazo_vencimiento_notificacion", e)
+
+
+@mcp.tool()
+def dias_habiles_entre(
+    fecha_a: str,
+    fecha_b: str,
+    sabado_inhabil: bool = True,
+    agosto_inhabil: bool = False,
+    festivos_extra: Optional[list] = None,
+):
+    """Cuenta los días HÁBILES entre dos fechas (AAAA-MM-DD).
+
+    Cuenta los días hábiles del intervalo abierto por la izquierda y cerrado
+    por la derecha (desde el día siguiente a la fecha menor hasta la fecha
+    mayor, ambos según los criterios de inhabilidad). Aplica los mismos
+    criterios que las demás herramientas (domingos, sábados si procede,
+    festivos nacionales + extra y agosto si procede). El orden de las fechas
+    es indiferente.
+    """
+    try:
+        import datetime
+        festivos = _construir_festivos(festivos_extra)
+        d1 = datetime.date.fromisoformat(fecha_a)
+        d2 = datetime.date.fromisoformat(fecha_b)
+        inicio, fin = (d1, d2) if d1 <= d2 else (d2, d1)
+        contados = 0
+        actual = inicio
+        while actual < fin:
+            actual = actual + datetime.timedelta(days=1)
+            if not _es_dia_inhabil(actual, sabado_inhabil, agosto_inhabil, festivos):
+                contados += 1
+        return {
+            "fecha_a": inicio.isoformat(),
+            "fecha_b": fin.isoformat(),
+            "dias_habiles": contados,
+            "dias_naturales": (fin - inicio).days,
+            "sabado_inhabil": sabado_inhabil,
+            "agosto_inhabil": agosto_inhabil,
+        }
+    except Exception as e:
+        return _err("dias_habiles_entre", e)
+
+
+
+# --------------------------------------------------------------------------- #
+# BLOQUE PREMIUM: Doc-merge por lotes + comandos combinados (360, adjuntos, Meet)
+# --------------------------------------------------------------------------- #
+
+_DOC_MIME = "application/vnd.google-apps.document"
+
+
+@mcp.tool()
+def drive_generar_desde_plantilla_lote(template_id: str, filas: list,
+                                       parent_id: str = "root",
+                                       patron_nombre: str = "Documento") -> dict:
+    """Genera un Documento de Google por cada fila a partir de una plantilla (mail-merge).
+
+    Para CADA dict de `filas`: copia el Documento `template_id`, nombra la copia con
+    `patron_nombre` formateado con la fila (p.ej. 'Contrato {nombre}' -> patron_nombre.format(**fila)),
+    reemplaza en la copia cada marcador '{{clave}}' por su valor mediante replaceAllText,
+    y mueve la copia a `parent_id`. Devuelve la lista de documentos creados (id, nombre).
+
+    `filas` es una lista de dicts, p.ej.:
+        [{"nombre": "Ana", "puesto": "Analista"}, {"nombre": "Luis", "puesto": "Jefe"}]
+    """
+    try:
+        drv = _get_service()
+        docs = _get_docs()
+        creados = []
+        for fila in filas:
+            try:
+                nombre = patron_nombre.format(**fila)
+            except Exception:
+                nombre = patron_nombre
+            copia = drv.files().copy(
+                fileId=template_id,
+                body={"name": nombre},
+                fields="id, name, parents",
+                supportsAllDrives=True,
+            ).execute()
+            copia_id = copia["id"]
+
+            requests = []
+            for clave, valor in fila.items():
+                requests.append({
+                    "replaceAllText": {
+                        "containsText": {"text": "{{" + str(clave) + "}}", "matchCase": True},
+                        "replaceText": str(valor),
+                    }
+                })
+            if requests:
+                docs.documents().batchUpdate(
+                    documentId=copia_id,
+                    body={"requests": requests},
+                ).execute()
+
+            prev = ",".join(copia.get("parents", []))
+            drv.files().update(
+                fileId=copia_id,
+                addParents=parent_id,
+                removeParents=prev,
+                fields="id, parents",
+                supportsAllDrives=True,
+            ).execute()
+
+            _audit("drive_generar_desde_plantilla_lote",
+                   {"template_id": template_id, "doc_id": copia_id, "nombre": nombre,
+                    "parent_id": parent_id})
+            creados.append({"id": copia_id, "nombre": nombre})
+        return {"ok": True, "generados": len(creados), "documentos": creados}
+    except Exception as e:
+        return _err("drive_generar_desde_plantilla_lote", e)
+
+
+@mcp.tool()
+def cliente_360(nombre_cliente: str, max_items: int = 10) -> dict:
+    """Vista 360 de un cliente: reune en un solo golpe su rastro en Drive, Gmail y Calendar.
+
+    Devuelve un dict con tres listas resumidas:
+      - `drive`: archivos/carpetas cuyo nombre contiene `nombre_cliente`.
+      - `correos`: correos recientes de/para el cliente (From, Subject, Date).
+      - `eventos`: proximos eventos de calendario que lo mencionan.
+    """
+    try:
+        tope = max(1, min(max_items, 50))
+        resultado = {"cliente": nombre_cliente, "drive": [], "correos": [], "eventos": []}
+
+        # (a) Drive: nombre contiene el cliente
+        try:
+            drv = _get_service()
+            safe = nombre_cliente.replace("'", "\\'")
+            q = "name contains '{}' and trashed = false".format(safe)
+            res = drv.files().list(q=q, spaces="drive", fields="files({})".format(FILE_FIELDS),
+                                   pageSize=tope, supportsAllDrives=True,
+                                   includeItemsFromAllDrives=True).execute()
+            resultado["drive"] = [_file(f) for f in res.get("files", [])]
+        except Exception as e:
+            resultado["drive_error"] = str(e)
+
+        # (b) Gmail: correos donde aparezca el cliente
+        try:
+            gm = _get_gmail()
+            gq = 'from:{0} OR to:{0} OR "{0}"'.format(nombre_cliente)
+            lst = gm.users().messages().list(userId="me", q=gq, maxResults=tope).execute()
+            for m in lst.get("messages", []):
+                full = gm.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["From", "To", "Subject", "Date"]).execute()
+                h = {x["name"]: x["value"] for x in full.get("payload", {}).get("headers", [])}
+                resultado["correos"].append({
+                    "id": m["id"], "from": h.get("From"), "to": h.get("To"),
+                    "subject": h.get("Subject"), "date": h.get("Date"),
+                    "snippet": full.get("snippet", "")[:160]})
+        except Exception as e:
+            resultado["correos_error"] = str(e)
+
+        # (c) Calendar: proximos eventos que lo mencionan
+        try:
+            import datetime as _dt
+            cal = _get_cal()
+            ahora = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            ev = cal.events().list(calendarId="primary", q=nombre_cliente, timeMin=ahora,
+                                   singleEvents=True, orderBy="startTime",
+                                   maxResults=tope).execute()
+            for e in ev.get("items", []):
+                st = e.get("start") or {}
+                resultado["eventos"].append({
+                    "id": e.get("id"), "summary": e.get("summary"),
+                    "inicio": st.get("dateTime") or st.get("date"),
+                    "link": e.get("htmlLink")})
+        except Exception as e:
+            resultado["eventos_error"] = str(e)
+
+        resultado["ok"] = True
+        return resultado
+    except Exception as e:
+        return _err("cliente_360", e)
+
+
+@mcp.tool()
+def archivar_adjuntos_recientes(dias: int = 7, parent_id: str = "root") -> dict:
+    """Archiva en Drive todos los adjuntos de los correos recientes con adjunto.
+
+    Busca en Gmail 'has:attachment newer_than:{dias}d', descarga cada adjunto y lo sube
+    a la carpeta `parent_id` de Drive. Devuelve la lista de adjuntos guardados (nombre, drive_id).
+    """
+    try:
+        gm = _get_gmail()
+        drv = _get_service()
+
+        def _walk(payload):
+            pila = [payload]
+            while pila:
+                p = pila.pop()
+                for c in (p.get("parts") or []):
+                    pila.append(c)
+                yield p
+
+        query = "has:attachment newer_than:{}d".format(max(1, dias))
+        lst = gm.users().messages().list(userId="me", q=query, maxResults=100).execute()
+        guardados = []
+        for m in lst.get("messages", []):
+            full = gm.users().messages().get(userId="me", id=m["id"], format="full").execute()
+            for p in _walk(full.get("payload", {})):
+                fn = p.get("filename")
+                body = p.get("body", {})
+                if fn and body.get("attachmentId"):
+                    att = gm.users().messages().attachments().get(
+                        userId="me", messageId=m["id"], id=body["attachmentId"]).execute()
+                    data = base64.urlsafe_b64decode(att["data"])
+                    media = MediaIoBaseUpload(io.BytesIO(data),
+                                              mimetype="application/octet-stream",
+                                              resumable=False)
+                    r = drv.files().create(body={"name": fn, "parents": [parent_id]},
+                                           media_body=media, fields="id, name",
+                                           supportsAllDrives=True).execute()
+                    _audit("archivar_adjuntos_recientes",
+                           {"message_id": m["id"], "file": fn, "drive_id": r["id"],
+                            "parent_id": parent_id})
+                    guardados.append({"nombre": fn, "drive_id": r["id"]})
+        return {"ok": True, "guardados": len(guardados), "adjuntos": guardados}
+    except Exception as e:
+        return _err("archivar_adjuntos_recientes", e)
+
+
+@mcp.tool()
+def agendar_reunion_cliente(summary: str, start: str, end: str, emails: list,
+                            descripcion: str = "", calendar_id: str = "primary") -> dict:
+    """Agenda una reunion con enlace de Google Meet e invita a los asistentes.
+
+    Crea un evento con videollamada de Google Meet (conferenceData/hangoutsMeet) e invita
+    a `emails` enviando la invitacion (sendUpdates='all'). start/end en RFC3339 con zona
+    (2026-08-05T10:00:00+01:00). Devuelve el id del evento y el enlace de Meet.
+    """
+    try:
+        import uuid as _uuid
+        cal = _get_cal()
+        body = {
+            "summary": summary,
+            "description": descripcion,
+            "start": {"dateTime": start},
+            "end": {"dateTime": end},
+            "attendees": [{"email": a} for a in (emails or [])],
+            "conferenceData": {
+                "createRequest": {
+                    "requestId": str(_uuid.uuid4()),
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                }
+            },
+        }
+        e = cal.events().insert(calendarId=calendar_id, body=body,
+                                conferenceDataVersion=1, sendUpdates="all").execute()
+        _audit("agendar_reunion_cliente",
+               {"summary": summary, "start": start, "event_id": e.get("id"),
+                "emails": list(emails or [])})
+        return {"ok": True, "id": e.get("id"), "meet": e.get("hangoutLink"),
+                "link": e.get("htmlLink")}
+    except Exception as e:
+        return _err("agendar_reunion_cliente", e)
 
 
 # --------------------------------------------------------------------------- #
