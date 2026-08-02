@@ -1324,7 +1324,7 @@ def calendar_disponibilidad(time_min: str, time_max: str, calendar_id: str = "pr
 
 
 @mcp.tool()
-def gmail_enviar(para: str, asunto: str, cuerpo: str, cc: Optional[str] = None, adjuntos_drive: Optional[list] = None):
+def gmail_enviar(para: str, asunto: str, cuerpo: str, cc: Optional[str] = None, cco: Optional[str] = None, adjuntos_drive: Optional[list] = None):
     """Envia un correo desde Gmail. Compone un mensaje MIME con destinatario, asunto y cuerpo de texto plano; admite copia (cc). Si se indican fileIds de Google Drive en adjuntos_drive, descarga cada archivo y lo adjunta al correo. Devuelve el id del mensaje enviado."""
     try:
         from email.mime.text import MIMEText
@@ -1337,6 +1337,8 @@ def gmail_enviar(para: str, asunto: str, cuerpo: str, cc: Optional[str] = None, 
         msg['Subject'] = asunto
         if cc:
             msg['Cc'] = cc
+        if cco:
+            msg['Bcc'] = cco
         msg.attach(MIMEText(cuerpo, 'plain', 'utf-8'))
         if adjuntos_drive:
             drive = _get_service()
@@ -2552,6 +2554,114 @@ def agendar_reunion_cliente(summary: str, start: str, end: str, emails: list,
                 "link": e.get("htmlLink")}
     except Exception as e:
         return _err("agendar_reunion_cliente", e)
+
+
+
+# --------------------------------------------------------------------------- #
+# GMAIL extra: hilos, estado leido/no leido y carpetas (etiquetas)
+# --------------------------------------------------------------------------- #
+
+@mcp.tool()
+def gmail_leer_hilo(thread_id: str, max_chars: int = 30000):
+    """Lee un HILO completo de Gmail (la conversacion con todas sus respuestas).
+    Devuelve, por cada mensaje, remitente, fecha, asunto y texto. Acepta el id del
+    hilo o el id de cualquier mensaje del hilo."""
+    try:
+        import base64 as _b64
+        svc = _get_gmail()
+        try:
+            th = svc.users().threads().get(userId='me', id=thread_id, format='full').execute()
+        except Exception:
+            m = svc.users().messages().get(userId='me', id=thread_id, format='minimal').execute()
+            th = svc.users().threads().get(userId='me', id=m['threadId'], format='full').execute()
+        msgs = []
+        for m in th.get('messages', []):
+            payload = m.get('payload', {})
+            h = {x['name']: x['value'] for x in payload.get('headers', [])}
+            text = ''
+            stack = [payload]
+            while stack:
+                p = stack.pop()
+                for c in (p.get('parts') or []):
+                    stack.append(c)
+                b = p.get('body', {})
+                if p.get('mimeType') == 'text/plain' and b.get('data'):
+                    text += _b64.urlsafe_b64decode(b['data']).decode('utf-8', 'replace')
+            msgs.append({'id': m.get('id'), 'from': h.get('From'), 'date': h.get('Date'),
+                         'subject': h.get('Subject'), 'texto': text[:max_chars]})
+        return {"ok": True, "thread_id": th.get('id'), "mensajes": len(msgs), "conversacion": msgs}
+    except Exception as e:
+        return _err("gmail_leer_hilo", e)
+
+
+@mcp.tool()
+def gmail_marcar_leido(message_id: str, leido: bool = True):
+    """Marca un correo como LEIDO (leido=True) o como NO LEIDO (leido=False)."""
+    try:
+        svc = _get_gmail()
+        body = {"removeLabelIds": ["UNREAD"]} if leido else {"addLabelIds": ["UNREAD"]}
+        svc.users().messages().modify(userId='me', id=message_id, body=body).execute()
+        _audit("gmail_marcar_leido", {"message_id": message_id, "leido": leido})
+        return {"ok": True, "message_id": message_id, "leido": leido}
+    except Exception as e:
+        return _err("gmail_marcar_leido", e)
+
+
+@mcp.tool()
+def gmail_listar_carpetas():
+    """Lista las carpetas/etiquetas de Gmail (nombre e id)."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().labels().list(userId='me').execute()
+        labels = [{"id": l.get("id"), "nombre": l.get("name"), "tipo": l.get("type")}
+                  for l in res.get("labels", [])]
+        return {"ok": True, "count": len(labels), "carpetas": labels}
+    except Exception as e:
+        return _err("gmail_listar_carpetas", e)
+
+
+@mcp.tool()
+def gmail_crear_carpeta(nombre: str):
+    """Crea una carpeta/etiqueta nueva en Gmail. Devuelve su id."""
+    try:
+        svc = _get_gmail()
+        l = svc.users().labels().create(userId='me', body={"name": nombre,
+            "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+        _audit("gmail_crear_carpeta", {"nombre": nombre, "id": l.get("id")})
+        return {"ok": True, "id": l.get("id"), "nombre": nombre}
+    except Exception as e:
+        return _err("gmail_crear_carpeta", e)
+
+
+@mcp.tool()
+def gmail_archivar_en(message_id: str, carpeta: str, crear_si_no_existe: bool = True,
+                      sacar_de_bandeja: bool = False):
+    """Guarda/mueve un correo a una carpeta (etiqueta) por su NOMBRE. Si no existe y
+    crear_si_no_existe=True, la crea. Con sacar_de_bandeja=True lo quita de la Bandeja de
+    entrada (archivar de verdad)."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().labels().list(userId='me').execute()
+        lid = None
+        for l in res.get("labels", []):
+            if (l.get("name") or "").lower() == carpeta.lower():
+                lid = l.get("id"); break
+        if not lid:
+            if not crear_si_no_existe:
+                return {"ok": False, "action": "gmail_archivar_en",
+                        "error": "La carpeta no existe y crear_si_no_existe=False."}
+            l = svc.users().labels().create(userId='me', body={"name": carpeta,
+                "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+            lid = l.get("id")
+        body = {"addLabelIds": [lid]}
+        if sacar_de_bandeja:
+            body["removeLabelIds"] = ["INBOX"]
+        svc.users().messages().modify(userId='me', id=message_id, body=body).execute()
+        _audit("gmail_archivar_en", {"message_id": message_id, "carpeta": carpeta,
+               "sacar_de_bandeja": sacar_de_bandeja})
+        return {"ok": True, "message_id": message_id, "carpeta": carpeta, "label_id": lid}
+    except Exception as e:
+        return _err("gmail_archivar_en", e)
 
 
 # --------------------------------------------------------------------------- #
