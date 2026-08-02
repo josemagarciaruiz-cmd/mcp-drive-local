@@ -3873,6 +3873,692 @@ def agenda_del_dia(fecha: Optional[str] = None) -> dict:
         return _err("agenda_del_dia", e)
 
 
+# =========================================================================
+# BLOQUE DLP (Prevencion de Fuga de Datos) - solo informa, no modifica nada
+# =========================================================================
+
+
+@mcp.tool()
+def dlp_escanear_compartidos(max_resultados: int = 300) -> dict:
+    """Escanea Google Drive en busca de ficheros compartidos por enlace publico
+    ('cualquiera con el enlace' o 'cualquiera puede encontrarlo') cuyo nombre
+    contenga palabras sensibles (token, clave, password, DNI, nomina, IBAN,
+    factura, contrato, historia clinica, etc.) y los marca como ALERTA con la
+    palabra coincidente. Solo informa: NO cambia permisos ni ficheros.
+
+    Args:
+        max_resultados: numero maximo de ficheros a devolver como alerta (por
+            defecto 300). Se lista una sola pagina para no agotar el tiempo.
+
+    Returns:
+        dict con el total revisado, el total de alertas y la lista de alertas.
+    """
+    action = "dlp_escanear_compartidos"
+    try:
+        import re  # noqa: F401
+        service = _get_service()
+        palabras = [
+            "token", "clave", "password", "contrase", "dni", "nie",
+            "pasaporte", "nomina", "nómina", "vida laboral", "iban",
+            "factura", "contrato", "historia clinica",
+        ]
+        q = ("(visibility='anyoneWithLink' or visibility='anyoneCanFind') "
+             "and trashed=false")
+        resp = service.files().list(
+            q=q,
+            pageSize=1000,
+            fields="nextPageToken, files(%s)" % FILE_FIELDS,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        ficheros = resp.get("files", [])
+        alertas = []
+        for meta in ficheros:
+            nombre_low = (meta.get("name") or "").lower()
+            coincidencias = [p for p in palabras if p in nombre_low]
+            if coincidencias:
+                item = _file(meta)
+                item["alerta"] = True
+                item["palabras_coincidentes"] = coincidencias
+                alertas.append(item)
+                if len(alertas) >= max_resultados:
+                    break
+        _audit(action, "revisados=%d alertas=%d" % (len(ficheros), len(alertas)))
+        return {
+            "ok": True,
+            "total_revisados": len(ficheros),
+            "total_alertas": len(alertas),
+            "alertas": alertas,
+        }
+    except Exception as e:
+        return _err(action, e)
+
+
+@mcp.tool()
+def dlp_revisar_texto(texto: str) -> dict:
+    """Analiza un texto (correo, documento o mensaje) y detecta datos personales
+    sensibles mediante expresiones regulares: DNI (8 digitos + letra), NIE
+    (X/Y/Z + 7 digitos + letra), IBAN espanol (ES + 22 digitos), telefono
+    espanol (9 digitos), email y numero de la Seguridad Social (12 digitos).
+    Devuelve que tipos aparecen y cuantos de cada uno, ENMASCARANDO los valores
+    (solo se muestran los ultimos 3 caracteres). Util para revisar algo antes de
+    enviarlo. Solo informa: NO modifica nada.
+
+    Args:
+        texto: texto a inspeccionar antes de enviarlo o publicarlo.
+
+    Returns:
+        dict con los tipos de dato sensible detectados, su recuento y muestras
+        enmascaradas.
+    """
+    action = "dlp_revisar_texto"
+    try:
+        import re
+        texto = texto or ""
+        patrones = {
+            "email": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+            "IBAN_ES": r"\bES\d{22}\b",
+            "NIE": r"\b[XYZxyz]\d{7}[A-Za-z]\b",
+            "DNI": r"\b\d{8}[A-Za-z]\b",
+            "num_seguridad_social": r"(?<!\d)\d{12}(?!\d)",
+            "telefono_ES": r"(?<!\d)\d{9}(?!\d)",
+        }
+        orden = [
+            "email", "IBAN_ES", "NIE", "DNI",
+            "num_seguridad_social", "telefono_ES",
+        ]
+        trabajo = texto
+        detectados = {}
+        for tipo in orden:
+            encontrados = []
+
+            def _rep(m, _acc=encontrados):
+                v = m.group(0)
+                _acc.append(v)
+                return " " * len(v)
+
+            trabajo = re.sub(patrones[tipo], _rep, trabajo)
+            if encontrados:
+                muestras = []
+                for v in encontrados:
+                    vs = v.strip()
+                    if len(vs) > 3:
+                        muestras.append("*" * (len(vs) - 3) + vs[-3:])
+                    else:
+                        muestras.append("*" * len(vs))
+                detectados[tipo] = {
+                    "cantidad": len(encontrados),
+                    "muestras": muestras,
+                }
+        _audit(action, "tipos=%s" % ",".join(detectados.keys()))
+        return {
+            "ok": True,
+            "hay_datos_sensibles": bool(detectados),
+            "tipos_detectados": list(detectados.keys()),
+            "detalle": detectados,
+        }
+    except Exception as e:
+        return _err(action, e)
+
+
+
+
+# =====================================================================
+# BLOQUE: Retencion documental (RGPD)
+# =====================================================================
+
+
+@mcp.tool()
+def retencion_listar_antiguos(folder_id: str, anios: int = 5,
+                              page_size: int = 200) -> dict:
+    """Lista los ficheros dentro de `folder_id` cuya fecha de modificacion sea
+    anterior a hace `anios` anios (candidatos a retencion/supresion RGPD).
+    Excluye los que esten bajo retencion legal (appProperties legal_hold='true').
+    Devuelve nombre, fecha e id de cada fichero, mas el total."""
+    try:
+        from datetime import datetime, timezone, timedelta
+        service = _get_service()
+        limite = datetime.now(timezone.utc) - timedelta(days=365 * anios)
+        q = "'%s' in parents and trashed=false" % folder_id
+        fields = ("nextPageToken, files(id, name, mimeType, modifiedTime, "
+                  "appProperties)")
+        antiguos = []
+        page_token = None
+        while True:
+            res = service.files().list(
+                q=q,
+                fields=fields,
+                pageSize=page_size,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            for f in res.get("files", []):
+                props = f.get("appProperties") or {}
+                if props.get("legal_hold") == "true":
+                    continue
+                mtime = f.get("modifiedTime")
+                if not mtime:
+                    continue
+                fecha = datetime.fromisoformat(mtime.replace("Z", "+00:00"))
+                if fecha < limite:
+                    antiguos.append({
+                        "id": f.get("id"),
+                        "nombre": f.get("name"),
+                        "fecha": mtime,
+                    })
+            page_token = res.get("nextPageToken")
+            if not page_token:
+                break
+        return {"ok": True, "folder_id": folder_id, "anios": anios,
+                "limite": limite.isoformat(), "total": len(antiguos),
+                "ficheros": antiguos}
+    except Exception as e:
+        return _err("retencion_listar_antiguos", e)
+
+
+@mcp.tool()
+def retencion_archivar(file_ids: list, carpeta_archivo_id: str) -> dict:
+    """Mueve cada fichero de `file_ids` a la carpeta `carpeta_archivo_id`
+    (patron drive_move). Salta los ficheros que esten bajo retencion legal
+    (appProperties legal_hold='true'). Devuelve el resultado por fichero."""
+    try:
+        service = _get_service()
+        resultados = []
+        for file_id in file_ids:
+            try:
+                current = service.files().get(
+                    fileId=file_id,
+                    fields="parents, name, appProperties",
+                    supportsAllDrives=True,
+                ).execute()
+                props = current.get("appProperties") or {}
+                if props.get("legal_hold") == "true":
+                    resultados.append({
+                        "file_id": file_id,
+                        "nombre": current.get("name"),
+                        "ok": False,
+                        "saltado": True,
+                        "motivo": "legal_hold activo",
+                    })
+                    continue
+                prev_parents = ",".join(current.get("parents", []))
+                meta = service.files().update(
+                    fileId=file_id,
+                    addParents=carpeta_archivo_id,
+                    removeParents=prev_parents,
+                    fields=FILE_FIELDS,
+                    supportsAllDrives=True,
+                ).execute()
+                _audit("retencion_archivar", {
+                    "file_id": file_id,
+                    "nombre": meta.get("name"),
+                    "desde": prev_parents,
+                    "hacia": carpeta_archivo_id,
+                })
+                resultados.append({
+                    "file_id": file_id,
+                    "ok": True,
+                    "saltado": False,
+                    "file": _file(meta),
+                })
+            except Exception as inner:
+                resultados.append({
+                    "file_id": file_id,
+                    "ok": False,
+                    "saltado": False,
+                    "error": str(inner),
+                })
+        movidos = sum(1 for r in resultados if r.get("ok"))
+        saltados = sum(1 for r in resultados if r.get("saltado"))
+        return {"ok": True, "carpeta_archivo_id": carpeta_archivo_id,
+                "total": len(file_ids), "movidos": movidos,
+                "saltados": saltados, "resultados": resultados}
+    except Exception as e:
+        return _err("retencion_archivar", e)
+
+
+@mcp.tool()
+def retencion_legal_hold(file_id: str, activar: bool = True) -> dict:
+    """Marca o desmarca un fichero como bajo retencion legal (legal hold),
+    fijando appProperties {'legal_hold': 'true'|'false'}. Los ficheros con
+    retencion legal quedan excluidos de la supresion y del archivado RGPD.
+    Devuelve el estado resultante."""
+    try:
+        from datetime import datetime, timezone
+        service = _get_service()
+        valor = "true" if activar else "false"
+        body = {"appProperties": {"legal_hold": valor}}
+        meta = service.files().update(
+            fileId=file_id,
+            body=body,
+            fields="id, appProperties",
+            supportsAllDrives=True,
+        ).execute()
+        _audit("retencion_legal_hold", {
+            "file_id": file_id,
+            "legal_hold": valor,
+            "cuando": datetime.now(timezone.utc).isoformat(),
+        })
+        props = meta.get("appProperties") or {}
+        return {"ok": True, "file_id": meta.get("id"),
+                "legal_hold": props.get("legal_hold"),
+                "activo": props.get("legal_hold") == "true"}
+    except Exception as e:
+        return _err("retencion_legal_hold", e)
+
+
+# --------------------------------------------------------------------------- #
+# COMPARTICION CON CADUCIDAD (portal ligero)
+# --------------------------------------------------------------------------- #
+
+@mcp.tool()
+def drive_compartir_temporal(file_id: str, email: str, dias: int = 7,
+                             rol: str = "reader") -> dict:
+    """Comparte un fichero con un usuario durante un numero limitado de dias.
+
+    Crea un permiso de tipo 'user' sobre `file_id` para el `email` indicado con
+    el rol `rol` y una fecha de caducidad (`expirationTime`) igual a AHORA mas
+    `dias` dias, en formato RFC3339 con sufijo 'Z'.
+
+    IMPORTANTE: Google Drive solo admite expiracion para los roles
+    'reader', 'commenter' y 'writer' (nunca 'owner'). Si se pasa otro rol se
+    devuelve un error accionable sin llamar a la API.
+
+    Devuelve el id del permiso creado, la fecha de caducidad efectiva y el
+    enlace (webViewLink) del fichero. El acceso puede revocarse antes de tiempo
+    con la herramienta existente `drive_remove_permission`.
+    """
+    try:
+        from datetime import datetime, timedelta, timezone
+        roles_validos = ("reader", "commenter", "writer")
+        if rol not in roles_validos:
+            return {
+                "ok": False,
+                "action": "drive_compartir_temporal",
+                "error": "El rol '%s' no admite caducidad." % rol,
+                "sugerencia": "La expiracion solo es valida para los roles: "
+                              "reader, commenter o writer (no owner).",
+            }
+        if dias <= 0:
+            return {
+                "ok": False,
+                "action": "drive_compartir_temporal",
+                "error": "El numero de dias debe ser mayor que 0.",
+                "sugerencia": "Indica cuantos dias durara el acceso (p.ej. 7).",
+            }
+        service = _get_service()
+        caduca_dt = datetime.now(timezone.utc) + timedelta(days=dias)
+        expiration = caduca_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {
+            "type": "user",
+            "role": rol,
+            "emailAddress": email,
+            "expirationTime": expiration,
+        }
+        perm = service.permissions().create(
+            fileId=file_id,
+            body=body,
+            fields="id,expirationTime",
+            supportsAllDrives=True,
+            sendNotificationEmail=True,
+        ).execute()
+        meta = service.files().get(
+            fileId=file_id, fields="webViewLink", supportsAllDrives=True
+        ).execute()
+        _audit("drive_compartir_temporal", {
+            "file_id": file_id,
+            "email": email,
+            "rol": rol,
+            "dias": dias,
+            "permission_id": perm.get("id"),
+            "expiration_time": perm.get("expirationTime", expiration),
+        })
+        return {
+            "ok": True,
+            "permission_id": perm.get("id"),
+            "caduca": perm.get("expirationTime", expiration),
+            "enlace": meta.get("webViewLink"),
+            "resumen": "Acceso '%s' a %s hasta %s."
+                       % (rol, email, perm.get("expirationTime", expiration)),
+        }
+    except Exception as e:
+        return _err("drive_compartir_temporal", e)
+
+
+@mcp.tool()
+def drive_permisos_con_caducidad(file_id: str) -> dict:
+    """Lista los permisos de un fichero que tengan fecha de caducidad.
+
+    Recupera todos los permisos de `file_id` y filtra los que incluyen
+    `expirationTime`, es decir, los accesos temporales. Devuelve quien tiene
+    acceso temporal, con que rol y hasta cuando, para revisar o revocar (esto
+    ultimo con la herramienta existente `drive_remove_permission`).
+    """
+    try:
+        service = _get_service()
+        resp = service.permissions().list(
+            fileId=file_id,
+            fields="permissions(id,emailAddress,role,expirationTime)",
+            supportsAllDrives=True,
+        ).execute()
+        permisos = resp.get("permissions", []) or []
+        temporales = [
+            {
+                "permission_id": p.get("id"),
+                "email": p.get("emailAddress"),
+                "rol": p.get("role"),
+                "caduca": p.get("expirationTime"),
+            }
+            for p in permisos
+            if p.get("expirationTime")
+        ]
+        return {
+            "ok": True,
+            "file_id": file_id,
+            "total": len(temporales),
+            "accesos_temporales": temporales,
+        }
+    except Exception as e:
+        return _err("drive_permisos_con_caducidad", e)
+
+
+# =========================================================================
+# BLOQUE: Control horario y facturacion (almacen en un Google Sheet)
+# =========================================================================
+
+
+def _hoja_horas(parent_id: str = 'root') -> str:
+    """Localiza (o crea) el Google Sheet 'Registro de horas - Aurea'.
+
+    Busca en Drive una hoja de calculo con ese nombre. Si no existe, la
+    crea en ``parent_id`` y escribe la fila de cabecera. Devuelve el
+    spreadsheetId.
+    """
+    service = _get_service()
+    q = ("name='Registro de horas - Aurea' and "
+         "mimeType='application/vnd.google-apps.spreadsheet' and "
+         "trashed=false")
+    encontrados = service.files().list(
+        q=q,
+        fields='files(id, name)',
+        pageSize=1,
+    ).execute().get('files', [])
+    if encontrados:
+        return encontrados[0]['id']
+    metadata = {
+        'name': 'Registro de horas - Aurea',
+        'mimeType': 'application/vnd.google-apps.spreadsheet',
+    }
+    if parent_id and parent_id != 'root':
+        metadata['parents'] = [parent_id]
+    creado = service.files().create(body=metadata, fields='id').execute()
+    sid = creado['id']
+    _get_sheets().spreadsheets().values().update(
+        spreadsheetId=sid,
+        range='A1',
+        valueInputOption='USER_ENTERED',
+        body={'values': [['Fecha', 'Cliente', 'Asunto', 'Minutos', 'Concepto']]},
+    ).execute()
+    return sid
+
+
+@mcp.tool()
+def horario_registrar(cliente: str, minutos: int, concepto: str = '',
+                      asunto: str = '', fecha: Optional[str] = None,
+                      parent_id: str = 'root') -> dict:
+    """Registra el tiempo dedicado a un cliente en la hoja de horas.
+
+    Args:
+        cliente: Nombre del cliente.
+        minutos: Minutos dedicados.
+        concepto: Descripcion del concepto o tarea facturable.
+        asunto: Asunto o expediente relacionado.
+        fecha: Fecha en formato 'AAAA-MM-DD'; si se omite se usa hoy.
+        parent_id: Carpeta de Drive donde crear la hoja si no existe.
+
+    Devuelve un dict con 'ok' y el total de filas registradas.
+    """
+    try:
+        import datetime
+        sid = _hoja_horas(parent_id)
+        f = fecha or datetime.date.today().isoformat()
+        fila = [f, cliente, asunto, minutos, concepto]
+        resp = _get_sheets().spreadsheets().values().append(
+            spreadsheetId=sid,
+            range='A:E',
+            valueInputOption='USER_ENTERED',
+            body={'values': [fila]},
+        ).execute()
+        _audit('horario_registrar',
+               "cliente=%s minutos=%s fecha=%s" % (cliente, minutos, f))
+        columna_a = _get_sheets().spreadsheets().values().get(
+            spreadsheetId=sid,
+            range='A:A',
+        ).execute().get('values', [])
+        total_filas = max(0, len(columna_a) - 1)
+        return {
+            'ok': True,
+            'spreadsheetId': sid,
+            'fila': fila,
+            'rango_actualizado': resp.get('updates', {}).get('updatedRange', ''),
+            'total_filas': total_filas,
+        }
+    except Exception as e:
+        return _err('horario_registrar', e)
+
+
+@mcp.tool()
+def horario_informe(cliente: Optional[str] = None,
+                    mes: Optional[str] = None) -> dict:
+    """Genera un informe de dedicacion a partir de la hoja de horas.
+
+    Args:
+        cliente: Si se indica, filtra por este cliente.
+        mes: Si se indica (formato 'AAAA-MM'), filtra por ese mes comparando
+            el inicio de la fecha de cada registro.
+
+    Devuelve el total de minutos y de horas y el desglose por cliente.
+    """
+    try:
+        sid = _hoja_horas()
+        filas = _get_sheets().spreadsheets().values().get(
+            spreadsheetId=sid,
+            range='A2:E',
+        ).execute().get('values', [])
+        total_min = 0
+        registros = 0
+        por_cliente: dict = {}
+        for fila in filas:
+            f = fila[0] if len(fila) > 0 else ''
+            c = fila[1] if len(fila) > 1 else ''
+            m = fila[3] if len(fila) > 3 else 0
+            if cliente and c != cliente:
+                continue
+            if mes and not str(f).startswith(mes):
+                continue
+            try:
+                texto = str(m).strip().replace(',', '.')
+                mins = int(float(texto)) if texto else 0
+            except (ValueError, TypeError):
+                mins = 0
+            total_min += mins
+            registros += 1
+            por_cliente[c] = por_cliente.get(c, 0) + mins
+        return {
+            'ok': True,
+            'filtro_cliente': cliente,
+            'filtro_mes': mes,
+            'registros': registros,
+            'total_minutos': total_min,
+            'total_horas': round(total_min / 60.0, 2),
+            'desglose_por_cliente': por_cliente,
+        }
+    except Exception as e:
+        return _err('horario_informe', e)
+
+
+@mcp.tool()
+def horario_estimar_cliente(cliente: str, dias: int = 30) -> dict:
+    """Estima orientativamente la dedicacion a un cliente.
+
+    Combina el numero de correos de Gmail con ese cliente y la duracion de
+    las reuniones de Calendar que lo mencionen en el periodo indicado.
+
+    Args:
+        cliente: Nombre o termino de busqueda del cliente.
+        dias: Numero de dias hacia atras a considerar.
+
+    Devuelve el desglose y una estimacion (10 min por correo + duracion de
+    reuniones).
+    """
+    try:
+        import datetime
+        gmail = _get_gmail()
+        q = "%s newer_than:%sd" % (cliente, dias)
+        num_correos = 0
+        page_token = None
+        while True:
+            r = gmail.users().messages().list(
+                userId='me', q=q, pageToken=page_token, maxResults=500,
+            ).execute()
+            num_correos += len(r.get('messages', []))
+            page_token = r.get('nextPageToken')
+            if not page_token:
+                break
+        cal = _get_cal()
+        ahora = datetime.datetime.utcnow()
+        time_min = (ahora - datetime.timedelta(days=dias)).isoformat() + 'Z'
+        time_max = ahora.isoformat() + 'Z'
+        eventos = cal.events().list(
+            calendarId='primary',
+            q=cliente,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime',
+        ).execute().get('items', [])
+        num_reuniones = 0
+        min_reuniones = 0
+        for ev in eventos:
+            ini = ev.get('start', {}).get('dateTime')
+            fin = ev.get('end', {}).get('dateTime')
+            if not ini or not fin:
+                continue
+            try:
+                di = datetime.datetime.fromisoformat(ini.replace('Z', '+00:00'))
+                df = datetime.datetime.fromisoformat(fin.replace('Z', '+00:00'))
+                dur = int((df - di).total_seconds() // 60)
+            except (ValueError, TypeError):
+                continue
+            if dur > 0:
+                min_reuniones += dur
+                num_reuniones += 1
+        min_correos = num_correos * 10
+        total_min = min_correos + min_reuniones
+        return {
+            'ok': True,
+            'cliente': cliente,
+            'dias': dias,
+            'num_correos': num_correos,
+            'minutos_correos_estimados': min_correos,
+            'num_reuniones': num_reuniones,
+            'minutos_reuniones': min_reuniones,
+            'estimacion_minutos': total_min,
+            'estimacion_horas': round(total_min / 60.0, 2),
+            'nota': 'Estimacion orientativa: 10 min por correo + duracion de reuniones.',
+        }
+    except Exception as e:
+        return _err('horario_estimar_cliente', e)
+
+
+
+
+@mcp.tool()
+def buscar_en_todo(texto: str, max_por_fuente: int = 8) -> dict:
+    """Búsqueda unificada por contenido en Drive, Gmail y Calendar a la vez.
+
+    Busca `texto` simultáneamente en los tres servicios de Google y devuelve
+    un panorama común del despacho:
+      - Drive: documentos cuyo CONTENIDO contiene el texto (fullText contains).
+      - Gmail: correos que coincidan con la consulta (con De/Asunto/Fecha).
+      - Calendar: eventos que coincidan (resumen, fecha y enlace).
+
+    Args:
+        texto: Término o frase a buscar. Es la base de "pregúntale a todo tu despacho".
+        max_por_fuente: Máximo de resultados por cada fuente (Drive, Gmail, Calendar).
+
+    Returns:
+        dict con las listas 'archivos', 'correos' y 'eventos', más el recuento total.
+    """
+    try:
+        archivos = []
+        correos = []
+        eventos = []
+
+        # (a) Drive: búsqueda por contenido. Escapamos comillas simples para la query.
+        texto_drive = texto.replace("'", "\\'")
+        drive = _get_service()
+        resp = drive.files().list(
+            q="fullText contains '" + texto_drive + "' and trashed=false",
+            fields="files(" + FILE_FIELDS + ")",
+            pageSize=max_por_fuente,
+        ).execute()
+        for meta in resp.get("files", []):
+            f = _file(meta)
+            archivos.append({
+                "nombre": f.get("name") or meta.get("name"),
+                "tipo": f.get("mimeType") or meta.get("mimeType"),
+                "enlace": f.get("webViewLink") or meta.get("webViewLink"),
+            })
+
+        # (b) Gmail: mensajes que coincidan y sus metadatos From/Subject/Date.
+        gmail = _get_gmail()
+        lista = gmail.users().messages().list(
+            userId="me", q=texto, maxResults=max_por_fuente
+        ).execute()
+        for m in lista.get("messages", []):
+            det = gmail.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            ).execute()
+            cabeceras = {}
+            for h in det.get("payload", {}).get("headers", []):
+                cabeceras[h.get("name")] = h.get("value")
+            correos.append({
+                "id": m["id"],
+                "de": cabeceras.get("From"),
+                "asunto": cabeceras.get("Subject"),
+                "fecha": cabeceras.get("Date"),
+            })
+
+        # (c) Calendar: eventos que coincidan con el texto.
+        cal = _get_cal()
+        ev = cal.events().list(
+            calendarId="primary", q=texto, singleEvents=True,
+            orderBy="startTime", maxResults=max_por_fuente,
+        ).execute()
+        for item in ev.get("items", []):
+            inicio = item.get("start", {})
+            fecha = inicio.get("dateTime") or inicio.get("date")
+            eventos.append({
+                "id": item.get("id"),
+                "resumen": item.get("summary"),
+                "fecha": fecha,
+                "enlace": item.get("htmlLink"),
+            })
+
+        return {
+            "consulta": texto,
+            "archivos": archivos,
+            "correos": correos,
+            "eventos": eventos,
+            "total": len(archivos) + len(correos) + len(eventos),
+        }
+    except Exception as e:
+        return _err("buscar_en_todo", e)
+
+
 # --------------------------------------------------------------------------- #
 # Arranque
 # --------------------------------------------------------------------------- #
