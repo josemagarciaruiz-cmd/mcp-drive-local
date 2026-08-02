@@ -34,7 +34,9 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 # Configuración
 # --------------------------------------------------------------------------- #
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = ["https://www.googleapis.com/auth/drive",
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/calendar"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 # Campos estándar que devolvemos de cada archivo/carpeta
@@ -1118,6 +1120,199 @@ def drive_remediar_externos(page_size: int = 100, dry_run: bool = True) -> dict:
                 "omitidos_sin_permiso": omitidos, "acciones": acciones}
     except Exception as e:
         return _err("drive_remediar_externos", e)
+
+
+
+# --------------------------------------------------------------------------- #
+# GMAIL (lectura de correo y volcado de adjuntos a Drive)
+# --------------------------------------------------------------------------- #
+
+_gmail_service = None
+
+def _get_gmail():
+    global _gmail_service
+    if _gmail_service is None:
+        _gmail_service = build("gmail", "v1", credentials=_build_creds(), cache_discovery=False)
+    return _gmail_service
+
+
+def _gmail_walk(payload):
+    stack = [payload]
+    while stack:
+        p = stack.pop()
+        for c in (p.get("parts") or []):
+            stack.append(c)
+        yield p
+
+
+@mcp.tool()
+def gmail_buscar(query: str, max_results: int = 20) -> dict:
+    """Busca correos en Gmail con la sintaxis de Gmail. Ejemplos de `query`:
+    'has:attachment newer_than:7d', 'from:cliente@dominio.com', 'subject:nomina'."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().messages().list(userId="me", q=query,
+              maxResults=max(1, min(max_results, 100))).execute()
+        out = []
+        for m in res.get("messages", []):
+            full = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
+                   metadataHeaders=["From", "Subject", "Date"]).execute()
+            h = {x["name"]: x["value"] for x in full.get("payload", {}).get("headers", [])}
+            out.append({"id": m["id"], "from": h.get("From"), "subject": h.get("Subject"),
+                        "date": h.get("Date"), "snippet": full.get("snippet", "")[:160]})
+        return {"ok": True, "count": len(out), "messages": out}
+    except Exception as e:
+        return _err("gmail_buscar", e)
+
+
+@mcp.tool()
+def gmail_leer(message_id: str, max_chars: int = 20000) -> dict:
+    """Lee un correo de Gmail: remitente, asunto, fecha, texto y lista de adjuntos."""
+    try:
+        import base64 as _b64
+        svc = _get_gmail()
+        m = svc.users().messages().get(userId="me", id=message_id, format="full").execute()
+        payload = m.get("payload", {})
+        h = {x["name"]: x["value"] for x in payload.get("headers", [])}
+        text = ""
+        adjs = []
+        for p in _gmail_walk(payload):
+            fn = p.get("filename")
+            body = p.get("body", {})
+            if fn:
+                adjs.append({"filename": fn, "attachmentId": body.get("attachmentId"),
+                             "size": body.get("size")})
+            elif p.get("mimeType") == "text/plain" and body.get("data"):
+                text += _b64.urlsafe_b64decode(body["data"]).decode("utf-8", "replace")
+        return {"ok": True, "from": h.get("From"), "subject": h.get("Subject"),
+                "date": h.get("Date"), "texto": text[:max_chars], "adjuntos": adjs}
+    except Exception as e:
+        return _err("gmail_leer", e)
+
+
+@mcp.tool()
+def gmail_guardar_adjuntos(message_id: str, parent_id: str = "root") -> dict:
+    """Descarga los adjuntos de un correo de Gmail y los sube a una carpeta de Drive."""
+    try:
+        import base64 as _b64
+        svc = _get_gmail()
+        drv = _get_service()
+        m = svc.users().messages().get(userId="me", id=message_id, format="full").execute()
+        saved = []
+        for p in _gmail_walk(m.get("payload", {})):
+            fn = p.get("filename")
+            body = p.get("body", {})
+            if fn and body.get("attachmentId"):
+                att = svc.users().messages().attachments().get(
+                    userId="me", messageId=message_id, id=body["attachmentId"]).execute()
+                data = _b64.urlsafe_b64decode(att["data"])
+                media = MediaIoBaseUpload(io.BytesIO(data),
+                        mimetype="application/octet-stream", resumable=False)
+                r = drv.files().create(body={"name": fn, "parents": [parent_id]},
+                    media_body=media, fields="id, name").execute()
+                _audit("gmail_guardar_adjuntos", {"message_id": message_id, "file": fn,
+                       "drive_id": r["id"]})
+                saved.append({"filename": fn, "drive_id": r["id"]})
+        return {"ok": True, "guardados": len(saved), "adjuntos": saved}
+    except Exception as e:
+        return _err("gmail_guardar_adjuntos", e)
+
+
+
+# --------------------------------------------------------------------------- #
+# CALENDAR / MEET (agenda y reuniones con videollamada de Google Meet)
+# --------------------------------------------------------------------------- #
+
+_cal_service = None
+
+def _get_cal():
+    global _cal_service
+    if _cal_service is None:
+        _cal_service = build("calendar", "v3", credentials=_build_creds(), cache_discovery=False)
+    return _cal_service
+
+
+@mcp.tool()
+def calendar_listar_eventos(time_min: Optional[str] = None, time_max: Optional[str] = None,
+                            max_results: int = 20, calendar_id: str = "primary") -> dict:
+    """Lista eventos del calendario. Fechas en RFC3339 (2026-08-05T00:00:00Z). Si no se
+    da time_min, usa ahora (próximos eventos)."""
+    try:
+        import datetime as _dt
+        svc = _get_cal()
+        if not time_min:
+            time_min = _dt.datetime.utcnow().isoformat() + "Z"
+        params = dict(calendarId=calendar_id, timeMin=time_min, singleEvents=True,
+                      orderBy="startTime", maxResults=max(1, min(max_results, 100)))
+        if time_max:
+            params["timeMax"] = time_max
+        res = svc.events().list(**params).execute()
+        out = []
+        for e in res.get("items", []):
+            st = e.get("start", {}); en = e.get("end", {})
+            out.append({"id": e.get("id"), "summary": e.get("summary"),
+                        "inicio": st.get("dateTime") or st.get("date"),
+                        "fin": en.get("dateTime") or en.get("date"),
+                        "meet": e.get("hangoutLink"),
+                        "asistentes": [a.get("email") for a in e.get("attendees", [])],
+                        "link": e.get("htmlLink")})
+        return {"ok": True, "count": len(out), "eventos": out}
+    except Exception as e:
+        return _err("calendar_listar_eventos", e)
+
+
+@mcp.tool()
+def calendar_crear_evento(summary: str, start: str, end: str, description: str = "",
+                          attendees: Optional[list] = None, con_meet: bool = True,
+                          calendar_id: str = "primary") -> dict:
+    """Crea un evento en el calendario. start/end en RFC3339 con zona
+    (2026-08-05T10:00:00+01:00). con_meet=True añade enlace de Google Meet.
+    attendees = lista de emails (se les envía invitación)."""
+    try:
+        import uuid as _uuid
+        svc = _get_cal()
+        body = {"summary": summary, "description": description,
+                "start": {"dateTime": start}, "end": {"dateTime": end}}
+        if attendees:
+            body["attendees"] = [{"email": a} for a in attendees]
+        params = dict(calendarId=calendar_id, body=body, sendUpdates="all")
+        if con_meet:
+            body["conferenceData"] = {"createRequest": {"requestId": str(_uuid.uuid4()),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"}}}
+            params["conferenceDataVersion"] = 1
+        e = svc.events().insert(**params).execute()
+        _audit("calendar_crear_evento", {"summary": summary, "start": start})
+        return {"ok": True, "id": e.get("id"), "meet": e.get("hangoutLink"), "link": e.get("htmlLink")}
+    except Exception as e:
+        return _err("calendar_crear_evento", e)
+
+
+@mcp.tool()
+def calendar_buscar(query: str, max_results: int = 20, calendar_id: str = "primary") -> dict:
+    """Busca eventos por texto (nombre, asistente, descripción)."""
+    try:
+        svc = _get_cal()
+        res = svc.events().list(calendarId=calendar_id, q=query, singleEvents=True,
+              orderBy="startTime", maxResults=max(1, min(max_results, 100))).execute()
+        out = [{"id": e.get("id"), "summary": e.get("summary"),
+                "inicio": (e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date"),
+                "link": e.get("htmlLink")} for e in res.get("items", [])]
+        return {"ok": True, "count": len(out), "eventos": out}
+    except Exception as e:
+        return _err("calendar_buscar", e)
+
+
+@mcp.tool()
+def calendar_disponibilidad(time_min: str, time_max: str, calendar_id: str = "primary") -> dict:
+    """Devuelve los tramos OCUPADOS entre dos fechas (RFC3339), para localizar huecos."""
+    try:
+        svc = _get_cal()
+        res = svc.freebusy().query(body={"timeMin": time_min, "timeMax": time_max,
+              "items": [{"id": calendar_id}]}).execute()
+        busy = res.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+        return {"ok": True, "ocupado": busy}
+    except Exception as e:
+        return _err("calendar_disponibilidad", e)
 
 
 # --------------------------------------------------------------------------- #
