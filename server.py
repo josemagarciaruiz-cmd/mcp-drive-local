@@ -40,7 +40,9 @@ SCOPES = ["https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/gmail.settings.basic",
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/tasks",
-          "https://www.googleapis.com/auth/contacts"]
+          "https://www.googleapis.com/auth/contacts",
+          "https://www.googleapis.com/auth/forms.body",
+          "https://www.googleapis.com/auth/forms.responses.readonly"]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 
 # Campos estándar que devolvemos de cada archivo/carpeta
@@ -4150,6 +4152,110 @@ def retencion_legal_hold(file_id: str, activar: bool = True) -> dict:
 
 # --------------------------------------------------------------------------- #
 # COMPARTICION CON CADUCIDAD (portal ligero)
+# =========================================================================== #
+# GOOGLE FORMS (requiere scopes forms.body / forms.responses.readonly)
+# =========================================================================== #
+
+_forms_service = None
+
+def _get_forms():
+    global _forms_service
+    if _forms_service is None:
+        _forms_service = build("forms", "v1", credentials=_build_creds(),
+                               cache_discovery=False,
+                               discoveryServiceUrl="https://forms.googleapis.com/$discovery/rest?version=v1")
+    return _forms_service
+
+
+@mcp.tool()
+def forms_crear(titulo: str, descripcion: str = "", preguntas: Optional[list] = None) -> dict:
+    """Crea un formulario de Google Forms. `preguntas` es una lista de dicts, p. ej.:
+    [{"titulo":"Nombre y apellidos","tipo":"texto","requerida":true},
+     {"titulo":"Motivo de la consulta","tipo":"parrafo"},
+     {"titulo":"Materia","tipo":"opcion","opciones":["Despido","Nomina","Otro"]},
+     {"titulo":"Documentos que aporta","tipo":"casillas","opciones":["Contrato","Nominas"]}].
+    Tipos: 'texto' (respuesta corta), 'parrafo', 'opcion' (una), 'casillas' (varias).
+    Devuelve el id, el enlace para responder y el de edicion."""
+    try:
+        svc = _get_forms()
+        form = svc.forms().create(body={"info": {"title": titulo}}).execute()
+        fid = form["formId"]
+        requests = []
+        if descripcion:
+            requests.append({"updateFormInfo": {
+                "info": {"description": descripcion}, "updateMask": "description"}})
+        for i, p in enumerate(preguntas or []):
+            tipo = (p.get("tipo") or "texto").lower()
+            req = bool(p.get("requerida"))
+            if tipo in ("opcion", "casillas"):
+                qtype = "RADIO" if tipo == "opcion" else "CHECKBOX"
+                question = {"required": req, "choiceQuestion": {
+                    "type": qtype,
+                    "options": [{"value": str(o)} for o in (p.get("opciones") or [])]}}
+            else:
+                question = {"required": req, "textQuestion": {
+                    "paragraph": tipo == "parrafo"}}
+            requests.append({"createItem": {
+                "item": {"title": p.get("titulo", "Pregunta"),
+                         "questionItem": {"question": question}},
+                "location": {"index": i}}})
+        if requests:
+            svc.forms().batchUpdate(formId=fid, body={"requests": requests}).execute()
+        info = svc.forms().get(formId=fid).execute()
+        _audit("forms_crear", {"id": fid, "titulo": titulo})
+        return {"ok": True, "id": fid,
+                "responder_url": info.get("responderUri"),
+                "editar_url": "https://docs.google.com/forms/d/" + fid + "/edit"}
+    except Exception as e:
+        return _err("forms_crear", e)
+
+
+@mcp.tool()
+def forms_leer(form_id: str) -> dict:
+    """Devuelve la estructura de un formulario: titulo, descripcion, enlace para
+    responder y la lista de preguntas."""
+    try:
+        svc = _get_forms()
+        f = svc.forms().get(formId=form_id).execute()
+        preguntas = []
+        for it in f.get("items", []):
+            q = it.get("questionItem", {}).get("question", {})
+            tipo = "parrafo" if q.get("textQuestion", {}).get("paragraph") else (
+                   "opcion/casillas" if q.get("choiceQuestion") else "texto")
+            preguntas.append({"titulo": it.get("title"), "tipo": tipo})
+        return {"id": form_id, "titulo": f.get("info", {}).get("title"),
+                "descripcion": f.get("info", {}).get("description"),
+                "responder_url": f.get("responderUri"), "preguntas": preguntas}
+    except Exception as e:
+        return _err("forms_leer", e)
+
+
+@mcp.tool()
+def forms_respuestas(form_id: str, max_resultados: int = 100) -> dict:
+    """Lista las respuestas recibidas en un formulario. Devuelve, por cada respuesta,
+    la fecha y las contestaciones (pregunta -> valor)."""
+    try:
+        svc = _get_forms()
+        f = svc.forms().get(formId=form_id).execute()
+        # mapa itemId/questionId -> titulo de la pregunta
+        qmap = {}
+        for it in f.get("items", []):
+            qid = it.get("questionItem", {}).get("question", {}).get("questionId")
+            if qid:
+                qmap[qid] = it.get("title")
+        res = svc.forms().responses().list(formId=form_id).execute()
+        out = []
+        for r in res.get("responses", [])[:max_resultados]:
+            answers = {}
+            for qid, a in (r.get("answers") or {}).items():
+                vals = [v.get("value") for v in a.get("textAnswers", {}).get("answers", [])]
+                answers[qmap.get(qid, qid)] = ", ".join(vals)
+            out.append({"fecha": r.get("lastSubmittedTime"), "respuestas": answers})
+        return {"total": len(out), "respuestas": out}
+    except Exception as e:
+        return _err("forms_respuestas", e)
+
+
 # --------------------------------------------------------------------------- #
 
 @mcp.tool()
@@ -4559,13 +4665,186 @@ def buscar_en_todo(texto: str, max_por_fuente: int = 8) -> dict:
         return _err("buscar_en_todo", e)
 
 
+# =========================================================================== #
+# NUEVAS HERRAMIENTAS (lote sin permisos nuevos): Gmail filtros/firma,
+# transcripciones de Meet y escaner de plazos en documentos.
+# =========================================================================== #
+
+@mcp.tool()
+def gmail_crear_filtro(de: Optional[str] = None, para: Optional[str] = None,
+                       asunto: Optional[str] = None, contiene: Optional[str] = None,
+                       tiene_adjunto: bool = False, etiquetar: Optional[str] = None,
+                       archivar: bool = False, marcar_leido: bool = False) -> dict:
+    """Crea una REGLA/FILTRO automatico en Gmail que se aplica a los correos entrantes.
+
+    Criterios (al menos uno): `de` (remitente), `para` (destinatario), `asunto`,
+    `contiene` (consulta libre estilo Gmail), `tiene_adjunto`.
+    Acciones (al menos una): `etiquetar` (nombre de etiqueta; se crea si no existe),
+    `archivar` (saca de la bandeja de entrada), `marcar_leido`.
+    Ejemplo: de='inspeccion@...', etiquetar='ITSS', archivar=True."""
+    try:
+        svc = _get_gmail()
+        crit = {}
+        if de: crit["from"] = de
+        if para: crit["to"] = para
+        if asunto: crit["subject"] = asunto
+        if contiene: crit["query"] = contiene
+        if tiene_adjunto: crit["hasAttachment"] = True
+        if not crit:
+            return {"error": "Indica al menos un criterio (de, para, asunto, contiene o tiene_adjunto)."}
+        action = {}
+        if etiquetar:
+            labels = svc.users().labels().list(userId="me").execute().get("labels", [])
+            lid = next((l["id"] for l in labels if l["name"].lower() == etiquetar.lower()), None)
+            if not lid:
+                lid = svc.users().labels().create(userId="me", body={
+                    "name": etiquetar, "labelListVisibility": "labelShow",
+                    "messageListVisibility": "show"}).execute()["id"]
+            action["addLabelIds"] = [lid]
+        rem = []
+        if archivar: rem.append("INBOX")
+        if marcar_leido: rem.append("UNREAD")
+        if rem: action["removeLabelIds"] = rem
+        if not action:
+            return {"error": "Indica una accion (etiquetar, archivar o marcar_leido)."}
+        r = svc.users().settings().filters().create(
+            userId="me", body={"criteria": crit, "action": action}).execute()
+        _audit("gmail_crear_filtro", {"id": r.get("id"), "criteria": crit})
+        return {"ok": True, "id": r.get("id"), "criterios": crit, "accion": action}
+    except Exception as e:
+        return _err("gmail_crear_filtro", e)
+
+
+@mcp.tool()
+def gmail_listar_filtros() -> dict:
+    """Lista los filtros/reglas automaticas configuradas en Gmail (id, criterios y accion)."""
+    try:
+        svc = _get_gmail()
+        res = svc.users().settings().filters().list(userId="me").execute()
+        out = []
+        for f in res.get("filter", []):
+            out.append({"id": f.get("id"), "criterios": f.get("criteria"),
+                        "accion": f.get("action")})
+        return {"filtros": out, "total": len(out)}
+    except Exception as e:
+        return _err("gmail_listar_filtros", e)
+
+
+@mcp.tool()
+def gmail_eliminar_filtro(filtro_id: str) -> dict:
+    """Elimina un filtro/regla de Gmail por su id (ver gmail_listar_filtros)."""
+    try:
+        svc = _get_gmail()
+        svc.users().settings().filters().delete(userId="me", id=filtro_id).execute()
+        _audit("gmail_eliminar_filtro", {"id": filtro_id})
+        return {"ok": True, "id": filtro_id}
+    except Exception as e:
+        return _err("gmail_eliminar_filtro", e)
+
+
+@mcp.tool()
+def gmail_definir_firma(texto: str, email: Optional[str] = None) -> dict:
+    """Define la FIRMA del correo (HTML o texto) para tu direccion principal o la
+    direccion `email` indicada. Sustituye la firma actual de esa direccion."""
+    try:
+        svc = _get_gmail()
+        sendas = svc.users().settings().sendAs().list(userId="me").execute().get("sendAs", [])
+        addr = email or next((s["sendAsEmail"] for s in sendas if s.get("isPrimary")), None)
+        if not addr:
+            return {"error": "No encuentro la direccion de envio principal."}
+        svc.users().settings().sendAs().patch(
+            userId="me", sendAsEmail=addr, body={"signature": texto}).execute()
+        _audit("gmail_definir_firma", {"email": addr})
+        return {"ok": True, "email": addr}
+    except Exception as e:
+        return _err("gmail_definir_firma", e)
+
+
+@mcp.tool()
+def gmail_ver_firma(email: Optional[str] = None) -> dict:
+    """Muestra la firma configurada para tu direccion principal (o la indicada)."""
+    try:
+        svc = _get_gmail()
+        sendas = svc.users().settings().sendAs().list(userId="me").execute().get("sendAs", [])
+        target = None
+        for s in sendas:
+            if (email and s.get("sendAsEmail") == email) or (not email and s.get("isPrimary")):
+                target = s; break
+        if not target:
+            return {"error": "No encuentro esa direccion de envio."}
+        return {"email": target.get("sendAsEmail"), "firma": target.get("signature", "")}
+    except Exception as e:
+        return _err("gmail_ver_firma", e)
+
+
+@mcp.tool()
+def meet_transcripciones(dias: int = 30, contiene: str = "") -> dict:
+    """Localiza en tu Drive las TRANSCRIPCIONES y notas que Google Meet deja tras las
+    reuniones (Google las guarda como Documentos de Google, normalmente en la carpeta
+    'Meet Recordings'). Devuelve los documentos candidatos de los ultimos `dias`; si se
+    da `contiene`, filtra por su contenido. Luego puedes leer uno con drive_read_file
+    y redactar el acta."""
+    try:
+        import datetime as _dt
+        svc = _get_service()
+        since = (_dt.datetime.utcnow() - _dt.timedelta(days=max(1, dias))).strftime("%Y-%m-%dT%H:%M:%SZ")
+        base = "mimeType='application/vnd.google-apps.document' and trashed=false and modifiedTime > '" + since + "'"
+        if contiene:
+            c = contiene.replace("'", "\\'")
+            q = base + " and fullText contains '" + c + "'"
+        else:
+            terms = ["Transcript", "Transcripción", "Notas de la reunión",
+                     "Gemini", "Recording", "Grabación"]
+            q = base + " and (" + " or ".join("name contains '" + t + "'" for t in terms) + ")"
+        res = svc.files().list(q=q, orderBy="modifiedTime desc",
+              fields="files(id,name,modifiedTime,webViewLink)", pageSize=25,
+              includeItemsFromAllDrives=True, supportsAllDrives=True).execute()
+        return {"transcripciones": res.get("files", []), "total": len(res.get("files", []))}
+    except Exception as e:
+        return _err("meet_transcripciones", e)
+
+
+@mcp.tool()
+def documento_escanear_plazos(file_id: str) -> dict:
+    """Lee un documento de Drive (resolucion, notificacion, requerimiento...) y DETECTA
+    fechas y plazos en su texto: fechas explicitas (dd/mm/aaaa o 'dd de mes de aaaa') y
+    expresiones del tipo 'en el plazo de N dias (habiles/naturales)'. Devuelve lo hallado
+    para que luego crees los eventos y tareas oportunos. No calcula por si mismo el
+    vencimiento definitivo: sirve de apoyo, no sustituye la verificacion del profesional."""
+    try:
+        import re as _re
+        r = drive_read_file(file_id)
+        texto = r.get("content") or r.get("text") or ""
+        if not texto:
+            return {"error": "No pude extraer texto del documento.", "detalle": r}
+        meses = "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre"
+        fechas = []
+        for m in _re.finditer(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", texto):
+            fechas.append(m.group(0))
+        for m in _re.finditer(r"\b\d{1,2}\s+de\s+(?:" + meses + r")\s+de\s+\d{4}\b", texto, _re.IGNORECASE):
+            fechas.append(m.group(0))
+        plazos = []
+        for m in _re.finditer(r"plazo\s+de\s+(\w+|\d+)\s+d[ií]as(?:\s+(h[aá]biles|naturales))?", texto, _re.IGNORECASE):
+            plazos.append(m.group(0).strip())
+        # dedupe conservando orden
+        def uniq(xs):
+            seen = set(); out = []
+            for x in xs:
+                k = x.lower()
+                if k not in seen:
+                    seen.add(k); out.append(x)
+            return out
+        return {"ok": True, "nombre": r.get("name"),
+                "fechas_detectadas": uniq(fechas),
+                "plazos_detectados": uniq(plazos),
+                "aviso": "Deteccion automatica de apoyo; verifica cada plazo en el procedimiento concreto."}
+    except Exception as e:
+        return _err("documento_escanear_plazos", e)
+
+
 # --------------------------------------------------------------------------- #
 # Arranque
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    _t = os.environ.get("MCP_TRANSPORT", "stdio")
-    if _t == "streamable-http":
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run()
+    mcp.run(transport="streamable-http")
