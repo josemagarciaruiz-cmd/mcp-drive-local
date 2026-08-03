@@ -1,7 +1,8 @@
 @echo off
-title Instalar Conector MCP Drive
+title Instalar SOLO el Agente Drive
 echo ============================================================
-echo   INSTALADOR DEL CONECTOR MCP DRIVE (Windows)
+echo   INSTALADOR DEL AGENTE DRIVE (solo el agente)
+echo   El conector lo usas por URL: esto NO lo toca.
 echo ============================================================
 echo.
 where python >nul 2>&1
@@ -13,32 +14,28 @@ if errorlevel 1 (
   pause
   exit /b
 )
-if exist server.py goto INSTALL
-where git >nul 2>&1
-if errorlevel 1 (
-  echo No encuentro el proyecto ni Git.
-  echo Descomprime el ZIP y ejecuta este archivo DESDE DENTRO de la carpeta.
+if not exist agent.py (
+  echo No encuentro agent.py. Ejecuta este archivo DESDE DENTRO de la carpeta
+  echo descomprimida (la que tiene agent.py e instalar_agente.ps1).
   echo.
   pause
   exit /b
 )
-if not exist mcp-drive-local git clone https://github.com/josemagarciaruiz-cmd/mcp-drive-local
-cd mcp-drive-local
-:INSTALL
-echo Lanzando el instalador. Se abrira el navegador para autorizar con Google.
+echo Lanzando el instalador del agente...
 echo.
-powershell -ExecutionPolicy Bypass -File .\instalar.ps1
+powershell -ExecutionPolicy Bypass -File .\instalar_agente.ps1
 if errorlevel 1 (
   echo.
   echo ============================================================
-  echo   LA INSTALACION NO TERMINO. Revisa el mensaje de arriba y el
-  echo   archivo install_log.txt que se ha creado en esta carpeta.
+  echo   NO TERMINO. Revisa el mensaje de arriba y el archivo
+  echo   install_log.txt que se ha creado en esta carpeta.
   echo ============================================================
   pause
   exit /b
 )
 echo.
 echo ============================================================
-echo   LISTO. Abre Claude y pide: "usa mcp-drive para listar mi unidad".
+echo   LISTO. Abre Claude y pide:
+echo   "lista mis carpetas permitidas del Agente Drive".
 echo ============================================================
 pause

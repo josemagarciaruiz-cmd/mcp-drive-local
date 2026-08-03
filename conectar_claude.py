@@ -81,7 +81,9 @@ def main():
         py = os.path.join(HERE, ".venv/bin/python")
     server = os.path.join(HERE, "server.py")
     agent = os.path.join(HERE, "agent.py")
-    for f in (py, server, agent):
+    solo = ("--solo-agente" in sys.argv) or ("--agent-only" in sys.argv)
+    requeridos = (py, agent) if solo else (py, server, agent)
+    for f in requeridos:
         if not os.path.exists(f):
             sys.exit("ERROR: falta " + f + " (ejecuta antes el instalador).")
 
@@ -106,10 +108,11 @@ def main():
         d = {}
     d.setdefault("mcpServers", {})
 
-    d["mcpServers"]["mcp-drive"] = {
-        "command": py, "args": [server],
-        "env": dict(creds, MCP_TRANSPORT="stdio"),
-    }
+    if not solo:
+        d["mcpServers"]["mcp-drive"] = {
+            "command": py, "args": [server],
+            "env": dict(creds, MCP_TRANSPORT="stdio"),
+        }
     d["mcpServers"]["agente-drive"] = {
         "command": py, "args": [agent],
         "env": dict(creds, MCP_TRANSPORT="stdio", ALLOWED_DIRS=allowed),

@@ -45,3 +45,7 @@ entregan al instalador.
   sus claves, sobre su Drive.
 - Revocar acceso: borrar las credenciales en la consola, o el permiso en la seccion
   de "Aplicaciones de terceros" de su cuenta de Google.
+
+### API de Formularios (Google Forms)
+Si el cliente va a usar formularios (altas, encuestas), habilita también esta API en su proyecto:
+https://console.cloud.google.com/apis/library/forms.googleapis.com

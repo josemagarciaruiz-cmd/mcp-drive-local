@@ -23,7 +23,9 @@ SCOPES = ["https://www.googleapis.com/auth/drive",
           "https://www.googleapis.com/auth/gmail.settings.basic",
           "https://www.googleapis.com/auth/calendar",
           "https://www.googleapis.com/auth/tasks",
-          "https://www.googleapis.com/auth/contacts"]
+          "https://www.googleapis.com/auth/contacts",
+          "https://www.googleapis.com/auth/forms.body",
+          "https://www.googleapis.com/auth/forms.responses.readonly"]
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 
