@@ -119,11 +119,17 @@ def main():
     }
     json.dump(d, open(cfg, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-    print("OK. Conectores dados de alta: 'mcp-drive' (completo) y 'agente-drive' (puente).")
+    if solo:
+        print("OK. Conector dado de alta: 'agente-drive' (puente disco<->Drive).")
+    else:
+        print("OK. Conectores dados de alta: 'mcp-drive' (completo) y 'agente-drive' (puente).")
     print("  Config:     " + cfg)
     print("  Carpetas:   " + allowed)
     print("  Conectores: " + ", ".join(d["mcpServers"].keys()))
-    print("\nAbre Claude y pide, por ejemplo, 'usa mcp-drive para listar mi unidad'.")
+    if solo:
+        print("\nAbre Claude y pide, por ejemplo, 'lista mis carpetas permitidas del Agente Drive'.")
+    else:
+        print("\nAbre Claude y pide, por ejemplo, 'usa mcp-drive para listar mi unidad'.")
 
 
 if __name__ == "__main__":
