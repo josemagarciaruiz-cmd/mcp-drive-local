@@ -20,8 +20,14 @@ function Fail($msg) {
 }
 
 Write-Host "==> 1/3  Entorno y dependencias del agente..."
-python -m venv .venv
-if ($LASTEXITCODE -ne 0) { Fail "No se pudo crear el entorno de Python (.venv). Revisa que Python este instalado y marcado 'Add python.exe to PATH'." }
+$PYARG=$null
+foreach($v in @("3.13","3.12","3.11")){
+  & py "-$v" -c "import sys" 2>$null
+  if($LASTEXITCODE -eq 0){ $PYARG="-$v"; break }
+}
+if(-not $PYARG){ Fail "No hay una version de Python compatible instalada (hace falta 3.11, 3.12 o 3.13). Instala Python 3.13 desde https://www.python.org/downloads/ marcando 'Add python.exe to PATH' y repite." }
+& py $PYARG -m venv .venv
+if ($LASTEXITCODE -ne 0) { Fail "No se pudo crear el entorno de Python (.venv)." }
 
 $py  = ".\.venv\Scripts\python.exe"
 $pip = ".\.venv\Scripts\pip.exe"

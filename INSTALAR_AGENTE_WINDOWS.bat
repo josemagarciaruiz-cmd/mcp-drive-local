@@ -16,7 +16,7 @@ if errorlevel 1 (
 )
 if not exist agent.py (
   echo No encuentro agent.py. Ejecuta este archivo DESDE DENTRO de la carpeta
-  echo descomprimida (la que tiene agent.py e instalar_agente.ps1).
+  echo descomprimida, la que tiene agent.py e instalar_agente.ps1.
   echo.
   pause
   exit /b
