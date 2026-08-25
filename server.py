@@ -755,6 +755,45 @@ def drive_sheet_append_row(spreadsheet_id: str, range_a1: str, values: list) -> 
         return _err("drive_sheet_append_row", e)
 
 
+@mcp.tool()
+def drive_create_sheet(name: str, parent_id: str = "root",
+                       csv_content: str = "", delimiter: str = ",") -> dict:
+    """Crea una NUEVA Hoja de cálculo de Google (nativa) en Drive.
+
+    - Sin `csv_content`: crea una hoja VACÍA.
+    - Con `csv_content`: sube ese CSV/TSV y Drive lo CONVIERTE a Hoja nativa
+      en el servidor. El contenido viaja como media 'text/csv' (o
+      'text/tab-separated-values' si `delimiter` es tabulador) y el destino
+      'application/vnd.google-apps.spreadsheet' va en los METADATOS del
+      fichero. No se pone el mime de Google en el media: la API lo rechaza
+      con "Invalid MIME type provided for the uploaded content".
+
+    Devuelve el fichero creado; su `id` es el `spreadsheet_id` que luego
+    usan drive_sheet_read / drive_sheet_write / drive_sheet_append_row.
+    """
+    try:
+        service = _get_service()
+        body = {"name": name,
+                "mimeType": "application/vnd.google-apps.spreadsheet",
+                "parents": [parent_id]}
+        if csv_content:
+            media_mime = ("text/tab-separated-values"
+                          if delimiter == "\t" else "text/csv")
+            media = MediaIoBaseUpload(
+                io.BytesIO(csv_content.encode("utf-8")),
+                mimetype=media_mime, resumable=False)
+            meta = service.files().create(
+                body=body, media_body=media, fields=FILE_FIELDS,
+                supportsAllDrives=True).execute()
+        else:
+            meta = service.files().create(
+                body=body, fields=FILE_FIELDS,
+                supportsAllDrives=True).execute()
+        return {"ok": True, "file": _file(meta)}
+    except Exception as e:
+        return _err("drive_create_sheet", e)
+
+
 # --------------------------------------------------------------------------- #
 # NOVEDADES Y AUDITORÍA
 # --------------------------------------------------------------------------- #
